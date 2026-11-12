@@ -1,0 +1,4144 @@
+-- Stimmy Hub (WindUI)
+-- Re-running this script cleans up the previous copy automatically.
+
+local env = (getgenv and getgenv()) or _G
+if env.AnimalFarmStop then pcall(env.AnimalFarmStop) end
+local alive = true
+
+local WindUI = loadstring(game:HttpGet('https://raw.githubusercontent.com/jonathabejose-alt/Wind-UI-Boreal/refs/heads/main/WindUI-Shiny.lua'))()
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local CS = game:GetService("CollectionService")
+local UIS = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+local VirtualUser = game:GetService("VirtualUser")
+
+-- built-in anti-AFK (always on): answers the idle kick, plus a tiny input every 4 minutes
+local afkConn = LocalPlayer.Idled:Connect(function()
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+end)
+task.spawn(function()
+    while alive and task.wait(240) do
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end)
+    end
+end)
+
+local StateRemote = RS:WaitForChild("AskServerToSetSubStateRemoteFunction")
+
+-- ================= STAT READERS =================
+local function readStat(name)
+    local ok, result = pcall(function()
+        local sf = LocalPlayer.PlayerGui.AnimalStatsScreenGui.MainFrame.StatsFrame.StatsFrame
+        return math.clamp(sf[name].Holder.Clipping.Size.Y.Scale * 100, 0, 100)
+    end)
+    if ok then return result end
+    return nil
+end
+
+-- ================= CONFIG / STATE =================
+local Config = {
+    RefillStart = 90,    -- start refilling below this (raise to 100 to always top up)
+    UrgentBelow = 50,    -- if the other enabled stat is below this, switch to it
+    RefillTarget = 100,  -- keep going until this
+    TweenSpeed = 80,     -- studs per second
+    HeightOffset = 3,    -- how far above the source to stand
+    StandMode = "surface_up",
+    NoTeleport = false,
+    StallTime = 4,       -- seconds without the stat rising before switching source
+    FireInterval = 0.5,  -- seconds between remote calls
+    VerifyPrompt = true, -- only trust a source if the "Click E to eat/drink" prompt shows
+    PromptWait = 1.5,    -- seconds to wait for the prompt after arriving
+    FoodMode = "Terrain Grass", -- "Terrain Grass" (teleport to grass terrain) or "Prompt Search" (old spiral search)
+    SearchRadius = 200,  -- how far from the last grass to search (wide by default)
+    SearchStep = 6,      -- spacing between search points (studs)
+    SearchSpeed = 30,    -- slower speed while sweeping so the prompt can update
+    SearchDwell = 0.35,  -- pause at each search point (seconds)
+    ProbeEat = true,     -- also fire the eat remote at each point and watch the food bar
+    MainWaterOnly = true, -- drink only at the main water part (the big one under the map)
+    WaterName = "",      -- blank = auto-pick the biggest water part; or type its name
+    WaterMode = "Shoreline", -- "Shoreline" (terrain water, never underground) or "Parts" (old method)
+    FaceWater = true,    -- turn to look at the water while drinking (the game cancels drinking otherwise)
+    TiltToWater = false, -- also aim down at the water surface (off = only turn left/right)
+    PlaneShoreOffset = 0.5, -- flat-water maps: studs to stand past the waterline (negative = on the land side)
+    WaterSearchDistance = 2000, -- how far across the map Auto Drink may look for water (studs)
+}
+
+local State = {
+    Drinking = false, Eating = false,
+    Busy = false, Cancel = false, InCycle = false,
+    ReturnBack = true, NoclipMove = true, MovementNoclip = false,
+    Searching = false, ReturnFood = false, GoingHome = false,
+}
+
+local Spots = { Water = {}, Food = {} }                 -- learned spots {pos = Vector3}
+local Keywords = { Water = { "water" }, Food = {} }
+local SearchPaths = { Water = "", Food = "" }
+local TagNames = {
+    Water = { "WaterPart" },
+    Food = {},
+}
+local Blacklist = { Water = {}, Food = {} }             -- [key] = expiry time
+local NameStats = { Water = {}, Food = {} }
+local OnlyNames = { Water = {}, Food = {} }
+local SkipNames = { Water = {}, Food = {} }
+
+local function nameStat(kind, name)
+    name = name:lower()
+    local s = NameStats[kind][name]
+    if not s then
+        s = { good = 0, bad = 0 }
+        NameStats[kind][name] = s
+    end
+    return s
+end
+
+local function learnKey(src)
+    return (src.Parent and src.Parent.Name or "?") .. "/" .. src.Name
+end
+
+local function allowedSource(kind, src)
+    local n, k = src.Name:lower(), learnKey(src):lower()
+    if SkipNames[kind][n] or SkipNames[kind][k] then return false end
+    if next(OnlyNames[kind]) and not (OnlyNames[kind][n] or OnlyNames[kind][k]) then return false end
+    local s = NameStats[kind][k]
+    if s and s.good == 0 and s.bad >= 2 then return false end
+    return true
+end
+
+local Cooldown = { Water = 0, Food = 0 }
+local Cache = { Water = { list = {}, t = 0 }, Food = { list = {}, t = 0 } }
+local Status = "Idle"
+
+local function setStatus(s) Status = s end
+
+-- ================= REMOTES (separate) =================
+local function fireDrink() StateRemote:InvokeServer("Drinking") end
+local function fireEat()   StateRemote:InvokeServer("Eating") end
+
+local Kinds = {
+    Water = { stat = "Water", flag = "Drinking", fire = fireDrink, prompt = "drink" },
+    Food  = { stat = "Food",  flag = "Eating",   fire = fireEat,   prompt = "eat" },
+}
+
+local firing, firedAt = false, 0
+local function fireSafe(fn)
+    if firing and tick() - firedAt < 3 then return end
+    firing, firedAt = true, tick()
+    task.spawn(function()
+        pcall(fn)
+        firing = false
+    end)
+end
+
+-- when both Auto Eat and Auto Drink are on: if the OTHER stat is urgent (low) while
+-- this one is fine, stop this cycle so the scheduler can run the other one
+local function shouldYield(kind)
+    local other = kind == "Water" and "Food" or "Water"
+    if not State[Kinds[other].flag] then return false end
+    if tick() < Cooldown[other] then return false end
+    local mine, theirs = readStat(kind), readStat(other)
+    return mine ~= nil and theirs ~= nil and mine >= Config.UrgentBelow and theirs < Config.UrgentBelow
+end
+
+-- ================= "CLICK E TO EAT/DRINK" PROMPT =================
+-- returns: on (bool) and text, or nil if the prompt GUI can't be found
+local function promptState()
+    local pg = LocalPlayer.PlayerGui
+    local gui = pg:FindFirstChild("EatDrinkDisplayScreenGui")
+    if not gui then
+        -- mobile may use a differently named GUI
+        for _, g in ipairs(pg:GetChildren()) do
+            if g:IsA("ScreenGui") and g.Name:lower():find("eatdrink") then gui = g break end
+        end
+    end
+    if not gui then return nil end
+    local lab = gui:FindFirstChild("RightTextLabel", true)
+
+    local function shown(o)
+        local cur = o
+        while cur and cur ~= gui do
+            if cur:IsA("GuiObject") and not cur.Visible then return false end
+            cur = cur.Parent
+        end
+        return true
+    end
+
+    -- text from every visible label/button ("Click E to eat" on PC, "Tap to eat" on mobile)
+    local txt = {}
+    for _, d in ipairs(gui:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" and shown(d) then
+            txt[#txt + 1] = d.Text
+        end
+    end
+    local on = gui.Enabled and (lab and shown(lab) or (not lab and #txt > 0))
+    return on and true or false, table.concat(txt, " ")
+end
+
+-- strict = true: unknown counts as "off". strict = false: unknown counts as "on" (don't block).
+local function promptOn(kind, strict)
+    local on, txt = promptState()
+    if on == nil then return not strict end
+    if not on then return false end
+    return txt:lower():find("%f[%a]" .. Kinds[kind].prompt) ~= nil
+end
+
+-- true when the prompt reads like "stop drinking / stop eating": we're already doing it,
+-- so pressing again would CANCEL it. Everything that fires the remote checks this first.
+local function promptStop(kind)
+    local on, txt = promptState()
+    if not on or not txt then return false end
+    local t = txt:lower()
+    return t:find("%f[%a]stop") ~= nil or t:find("%f[%a]cancel") ~= nil
+end
+
+local function canFire(kind) return not promptStop(kind) end
+
+-- ================= CHARACTER / NOCLIP / MOVEMENT =================
+local function getRoot()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+
+local noclipOn, touched = false, {}
+local noclipConn, noclipDescendantConn
+local lastNoclipCheck = 0
+
+local function applyNoclipPart(part)
+    if not noclipOn or not part:IsA("BasePart") then return end
+    if part.CanCollide then
+        if touched[part] == nil then touched[part] = true end
+        part.CanCollide = false
+    elseif touched[part] == nil then
+        touched[part] = false
+    end
+end
+
+local function bindNoclipCharacter(char)
+    if noclipDescendantConn then noclipDescendantConn:Disconnect() noclipDescendantConn = nil end
+    if not noclipOn or not char then return end
+    for _, part in ipairs(char:GetDescendants()) do applyNoclipPart(part) end
+    noclipDescendantConn = char.DescendantAdded:Connect(applyNoclipPart)
+end
+
+local function setNoclip(on)
+    if noclipOn == on then return end
+    noclipOn = on
+    if on then
+        bindNoclipCharacter(LocalPlayer.Character)
+        if not noclipConn then
+            noclipConn = RunService.Heartbeat:Connect(function()
+                if not noclipOn or tick() - lastNoclipCheck < 0.35 then return end
+                lastNoclipCheck = tick()
+                local char = LocalPlayer.Character
+                if not char then return end
+                for _, part in ipairs(char:GetDescendants()) do applyNoclipPart(part) end
+            end)
+        end
+    else
+        if noclipDescendantConn then noclipDescendantConn:Disconnect() noclipDescendantConn = nil end
+        if noclipConn then noclipConn:Disconnect() noclipConn = nil end
+        for part, wasCollidable in pairs(touched) do
+            if part.Parent then part.CanCollide = wasCollidable end
+        end
+        touched = {}
+    end
+end
+
+local noclipCharacterConn = LocalPlayer.CharacterAdded:Connect(function(char)
+    if noclipOn then task.defer(bindNoclipCharacter, char) end
+end)
+
+local function refreshNoclip()
+    setNoclip(State.MovementNoclip or (State.NoclipMove and State.InCycle
+        and not State.Searching))
+end
+
+local holdConn
+local function stopHold()
+    if holdConn then
+        holdConn:Disconnect()
+        holdConn = nil
+    end
+end
+
+-- holds the character at `pos`; if `face` (a world point) is given, also keeps it looking at that point
+local function startHold(pos, face)
+    stopHold()
+    holdConn = RunService.Heartbeat:Connect(function()
+        local root = getRoot()
+        if not root then return end
+        root.AssemblyLinearVelocity = Vector3.zero
+        if face then
+            root.AssemblyAngularVelocity = Vector3.zero
+            root.CFrame = CFrame.lookAt(pos, face)
+        else
+            root.CFrame = CFrame.new(pos) * (root.CFrame - root.CFrame.Position)
+        end
+    end)
+end
+
+local function moveTo(targetPos, ignoreCancel, stopWhen, speed)
+    local spd = speed or Config.TweenSpeed
+    local root = getRoot()
+    if not root then return false end
+    local t0 = tick()
+    local maxTime = (root.Position - targetPos).Magnitude / spd * 2 + 5
+    while alive do
+        if State.Cancel and not ignoreCancel then return false end
+        if stopWhen and stopWhen() then return true end
+        root = getRoot()
+        if not root then return false end
+        local delta = targetPos - root.Position
+        local dist = delta.Magnitude
+        if dist < 0.5 then return true end
+        if tick() - t0 > maxTime then return false end
+        local dt = RunService.Heartbeat:Wait()
+        local step = math.min(dist, spd * dt)
+        root.CFrame = root.CFrame + delta.Unit * step
+        root.AssemblyLinearVelocity = Vector3.zero
+    end
+    return false
+end
+
+-- remembers where you stood on the ground before a water farm took you to the water,
+-- so turning Auto Drink off can put you back above ground
+local WaterOrigin, LastWaterPos
+
+local function markWaterStart()
+    local r = getRoot()
+    if not r then return end
+    -- keep the old ground spot only if we're still sitting at the water we teleported to
+    if not WaterOrigin or not LastWaterPos or (r.Position - LastWaterPos).Magnitude > 15 then
+        WaterOrigin = r.CFrame
+    end
+end
+
+-- ================= SOURCE DETECTION =================
+local function sourcePoint(src, from)
+    if src:IsA("BasePart") then
+        local rel = src.CFrame:PointToObjectSpace(from)
+        local h = src.Size / 2
+        local c = Vector3.new(
+            math.clamp(rel.X, -h.X, h.X),
+            math.clamp(rel.Y, -h.Y, h.Y),
+            math.clamp(rel.Z, -h.Z, h.Z)
+        )
+        local inside = (c - rel).Magnitude < 0.01
+        return src.CFrame:PointToWorldSpace(c), inside
+    elseif src:IsA("Model") then
+        local bestP, bestD, bestInside
+        for _, d in ipairs(src:GetDescendants()) do
+            if d:IsA("BasePart") then
+                local p, inside = sourcePoint(d, from)
+                local dist = (p - from).Magnitude
+                if not bestD or dist < bestD then
+                    bestP, bestD, bestInside = p, dist, inside
+                end
+            end
+        end
+        if bestP then return bestP, bestInside end
+        return src:GetPivot().Position, false
+    elseif src:IsA("Attachment") then
+        return src.WorldPosition, false
+    end
+    return nil, false
+end
+
+local function classify(d, kind)
+    local info = Kinds[kind]
+    if d:IsA("ProximityPrompt") then
+        local txt = d.ActionText:lower()
+        if txt:find("%f[%a]" .. info.prompt) then
+            return d.Parent
+        end
+        return nil
+    end
+    if d:IsA("BasePart") or d:IsA("Model") then
+        local n = d.Name:lower()
+        for _, kw in ipairs(Keywords[kind]) do
+            if kw ~= "" and n:find(kw, 1, true) then return d end
+        end
+        if kind == "Water" and Config.WaterName ~= "" and n == Config.WaterName:lower() then
+            return d
+        end
+    end
+    return nil
+end
+
+local function resolvePath(path)
+    local inst = workspace
+    for part in string.gmatch(path or "", "[^%.]+") do
+        inst = inst and inst:FindFirstChild(part)
+    end
+    return inst
+end
+
+-- surface area and height of a water source (for picking the main one)
+local function waterArea(s)
+    if s:IsA("BasePart") then
+        return s.Size.X * s.Size.Z, s.Position.Y
+    elseif s:IsA("Model") then
+        local cf, sz = s:GetBoundingBox()
+        return sz.X * sz.Z, cf.Position.Y
+    end
+    return 0, 0
+end
+
+-- main water part = the named one if a name is set, otherwise the LOWEST of the big water parts
+-- (the main water sits under the map; the small variants sit at ground level)
+local function pickMainWater(list)
+    local want = Config.WaterName:lower()
+    local pool = list
+    if want ~= "" then
+        pool = {}
+        for _, s in ipairs(list) do
+            if s.Name:lower() == want then pool[#pool + 1] = s end
+        end
+        if #pool == 0 then pool = list end
+    end
+    local rows, maxA = {}, 0
+    for _, s in ipairs(pool) do
+        local a, y = waterArea(s)
+        rows[#rows + 1] = { s = s, a = a, y = y }
+        if a > maxA then maxA = a end
+    end
+    local best
+    for _, r in ipairs(rows) do
+        if r.a >= maxA * 0.25 and (not best or r.y < best.y) then best = r end
+    end
+    return best and best.s or nil
+end
+
+local function scanSources(kind)
+    local list, seen, n = {}, {}, 0
+    local char = LocalPlayer.Character
+    local root = resolvePath(SearchPaths[kind]) or workspace
+    local doScan = (#Keywords[kind] > 0) or (#TagNames[kind] == 0 and kind == "Water")
+    -- Food with no keywords and no tags: only proximity prompts (cheap scan) are used
+    local promptOnly = (kind == "Food" and #Keywords.Food == 0 and #TagNames.Food == 0)
+    if promptOnly then doScan = true end
+    for _, d in ipairs(doScan and root:GetDescendants() or {}) do
+        n += 1
+        if n % 4000 == 0 then task.wait() end
+        local src = classify(d, kind)
+        if src and not seen[src] and not src:IsA("Terrain") and not (char and src:IsDescendantOf(char))
+            and not (src:IsA("BasePart") and src.Parent and seen[src.Parent]) then
+            seen[src] = true
+            list[#list + 1] = src
+        end
+    end
+    for _, tag in ipairs(TagNames[kind]) do
+        for _, inst in ipairs(CS:GetTagged(tag)) do
+            if (inst:IsA("BasePart") or inst:IsA("Model")) and not seen[inst] and inst:IsDescendantOf(workspace) then
+                seen[inst] = true
+                list[#list + 1] = inst
+            end
+        end
+    end
+    -- water: remember which source is the "main" one (preferred, but every other source stays as fallback)
+    local main
+    if kind == "Water" then main = pickMainWater(list) end
+    Cache[kind] = { list = list, t = tick(), main = main }
+    return list
+end
+
+local function findNearest(kind)
+    local root = getRoot()
+    if not root then return nil end
+
+    local c = Cache[kind]
+    if tick() - c.t > 20 or #c.list == 0 then
+        scanSources(kind)
+        c = Cache[kind]
+    end
+
+    local now, from = tick(), root.Position
+
+    -- preference: go to the main water part first. Only if it is unavailable (or just failed
+    -- the prompt check and is blacklisted for a while) do we fall back to the other sources.
+    if kind == "Water" and Config.MainWaterOnly then
+        local main = c.main
+        if main and main:IsDescendantOf(workspace) then
+            local bl = Blacklist.Water[main]
+            if not (bl and bl > now) then
+                local p, inside = sourcePoint(main, from)
+                if p then
+                    return {
+                        key = main,
+                        pos = inside and p or (p + Vector3.new(0, Config.HeightOffset, 0)),
+                        inst = main,
+                        name = main.Name,
+                        dist = (p - from).Magnitude,
+                    }
+                end
+            end
+        end
+    end
+
+    local best
+
+    local function consider(key, pos, inst, name)
+        local bl = Blacklist[kind][key]
+        if bl and bl > now then return end
+        local d = (pos - from).Magnitude
+        if not best or d < best.dist then
+            best = { key = key, pos = pos, inst = inst, name = name, dist = d }
+        end
+    end
+
+    for _, src in ipairs(c.list) do
+        if src:IsDescendantOf(workspace) and allowedSource(kind, src) then
+            local p, inside = sourcePoint(src, from)
+            if p then
+                consider(src, inside and p or (p + Vector3.new(0, Config.HeightOffset, 0)), src, src.Name)
+            end
+        end
+    end
+    for i, spot in ipairs(Spots[kind]) do
+        consider(spot, spot.pos, nil, "saved spot #" .. i)
+    end
+    return best
+end
+
+-- ================= PROMPT SEARCH (grass isn't a part) =================
+-- Walks a spiral until the game's own "Click E to eat" prompt turns on, eats until
+-- the grass disappears (prompt off), then spirals again from that spot.
+local LastFood
+local Visited = {}
+
+local function groundInfo(x, z, refY)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character }
+    local res = workspace:Raycast(Vector3.new(x, refY + 50, z), Vector3.new(0, -200, 0), params)
+    if res and math.abs(res.Position.Y - refY) < 25 then
+        return res.Position.Y, res.Material, res.Instance
+    end
+    return nil
+end
+
+local function groundY(x, z, refY)
+    local y = groundInfo(x, z, refY)
+    return y
+end
+
+-- lazy expanding-ring search: nearest spots first, then further out
+local function newGen(center, maxR)
+    return { c = center, r = Config.SearchStep, i = 0, n = nil, maxR = maxR, k = 0 }
+end
+
+local function genNext(g)
+    local step = Config.SearchStep
+    while g.r <= g.maxR do
+        if not g.n then
+            g.n = math.max(6, math.floor(2 * math.pi * g.r / step))
+            g.i = 0
+        end
+        while g.i < g.n do
+            local a = (g.i / g.n) * 2 * math.pi
+            g.i += 1
+            g.k += 1
+            if g.k % 20000 == 0 then task.wait() end
+            local pt = Vector3.new(g.c.X + math.cos(a) * g.r, 0, g.c.Z + math.sin(a) * g.r)
+            return pt
+        end
+        g.r += step
+        g.n = nil
+    end
+    return nil
+end
+
+local function foodPromptLoop(force, info)
+    local ignoreUntil = 0
+    local lastV, foodRise = readStat("Food"), 0
+    local function promptNow()
+        if tick() < ignoreUntil then return false end
+        local on, txt = promptState()
+        if not on then return false end
+        local t = txt:lower()
+        if not t:find("%f[%a]eat") then return false end
+        if t:find("%f[%a]stop") or t:find("%f[%a]cancel") then
+            -- "stop eating" can linger after you leave the grass: only trust it while food is rising
+            local v = readStat("Food")
+            if v and lastV and v > lastV + 0.1 then foodRise = tick() end
+            lastV = v
+            return tick() - foodRise < 2
+        end
+        return true
+    end
+
+    local function active()
+        return alive and not State.Cancel and (force or State[info.flag]) and getRoot() ~= nil
+    end
+
+    if promptState() == nil then
+        Cooldown.Food = tick() + 15
+        return "eat prompt GUI not found (EatDrinkDisplayScreenGui)"
+    end
+
+    -- stand on the ground while searching (the game may ignore a floating / noclipped animal)
+    State.Searching = true
+    refreshNoclip()
+    task.wait(0.1)
+
+    local standOff = Config.HeightOffset
+    do
+        local r0 = getRoot()
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if r0 then
+            local g0 = groundY(r0.Position.X, r0.Position.Z, r0.Position.Y)
+            if hum and hum.FloorMaterial ~= Enum.Material.Air and g0 then
+                standOff = r0.Position.Y - g0
+            elseif hum then
+                standOff = hum.HipHeight + r0.Size.Y / 2
+            end
+        end
+    end
+
+    local root = getRoot()
+
+    local function makeGen(pos)
+        return newGen(pos, Config.SearchRadius)
+    end
+
+    local startPos
+    if promptOn("Food", true) then
+        startPos = root.Position
+    elseif LastFood then
+        startPos = LastFood
+    else
+        local bd
+        for _, sp in ipairs(Spots.Food) do
+            local d = (sp.pos - root.Position).Magnitude
+            if not bd or d < bd then startPos, bd = sp.pos, d end
+        end
+        startPos = startPos or root.Position
+    end
+
+    Visited = {}
+    local gen = makeGen(startPos)
+    local holding = false
+    local best, lastProgress = 0, tick()
+
+    local function leave()
+        if holding then
+            stopHold()
+            holding = false
+        end
+    end
+
+    local probeHit = 0
+    -- move to one search point, stand still, and check for grass two ways:
+    -- the game's prompt, and (probe) whether the food bar rises when we fire the eat remote
+    local function searchMove(p)
+        local r = getRoot()
+        if not r then return end
+        local gy = groundY(p.X, p.Z, r.Position.Y)
+        local y = gy and (gy + standOff) or r.Position.Y
+        local flat = Vector3.new(p.X - r.Position.X, 0, p.Z - r.Position.Z).Magnitude
+        local spd = flat > Config.SearchStep * 3 and Config.TweenSpeed or Config.SearchSpeed
+        moveTo(Vector3.new(p.X, y, p.Z), false, promptNow, spd)
+        if promptNow() or not alive or State.Cancel then return end
+
+        local r2 = getRoot()
+        if not r2 then return end
+        startHold(r2.Position)
+        local base = readStat("Food") or 0
+        local t = tick()
+        while alive and not State.Cancel and tick() - t < Config.SearchDwell do
+            if promptNow() then break end
+            if Config.ProbeEat then
+                fireSafe(info.fire)
+                local nv = readStat("Food")
+                if nv and nv > base + 0.1 then
+                    probeHit = tick()
+                    break
+                end
+            end
+            task.wait(0.05)
+        end
+        stopHold()
+    end
+
+    while active() do
+        local v = readStat("Food")
+        if not v then leave() return "can't read food stat" end
+        if v >= Config.RefillTarget then leave() return "food full" end
+        if not force and shouldYield("Food") then leave() return "paused food, water is low" end
+        root = getRoot()
+
+        if promptNow() or tick() - probeHit < 2 then
+            -- prompt is showing (or the probe worked): stop moving and eat
+            if not holding then
+                holding = true
+                startHold(root.Position)
+                LastFood = root.Position
+                best, lastProgress = v, tick()
+                local near = false
+                for _, sp in ipairs(Spots.Food) do
+                    if (sp.pos - root.Position).Magnitude < 25 then near = true break end
+                end
+                if not near and #Spots.Food < 60 then
+                    table.insert(Spots.Food, { pos = root.Position })
+                end
+                setStatus("eating grass")
+            end
+            if v > best + 0.1 then best, lastProgress, probeHit = v, tick(), tick() end
+            if tick() - lastProgress > Config.StallTime then
+                leave()
+                ignoreUntil = tick() + 3
+            else
+                if canFire("Food") then fireSafe(info.fire) end
+                task.wait(Config.FireInterval)
+            end
+        else
+            if holding then
+                -- grass eaten and gone: search outward from here again
+                leave()
+                gen = makeGen(root.Position)
+            end
+
+            local p = genNext(gen)
+            if not p then
+                Visited[#Visited + 1] = gen.c
+                local nxt, bd
+                for _, sp in ipairs(Spots.Food) do
+                    local seen = false
+                    for _, c in ipairs(Visited) do
+                        if (c - sp.pos).Magnitude < Config.SearchRadius * 0.6 then seen = true break end
+                    end
+                    if not seen then
+                        local d = (sp.pos - root.Position).Magnitude
+                        if not bd or d < bd then nxt, bd = sp.pos, d end
+                    end
+                end
+                if not nxt then
+                    Cooldown.Food = tick() + 15
+                    return "no grass found within search radius"
+                end
+                setStatus("heading to saved food spot")
+                moveTo(nxt, false, promptNow)
+                gen = makeGen(nxt)
+            else
+                setStatus(string.format("searching for grass (ring %d studs)", gen.r))
+                searchMove(p)
+            end
+        end
+    end
+    leave()
+    return "stopped"
+end
+
+-- ================= TERRAIN GRASS (grass is the Grass terrain material, not a part) =================
+-- Reads the terrain voxels around you, finds the grass surface, teleports to the nearest spot and
+-- eats there. A spot is only trusted if the game's own "eat" prompt shows up on it.
+local GrassMats = { [Enum.Material.Grass] = true } -- add Enum.Material.LeafyGrass here if it also works
+
+local function grassKey(p) return math.floor(p.X / 6) .. "," .. math.floor(p.Z / 6) end
+
+local function scanTerrainGrass(center)
+    local pts, seen = {}, {}
+    local R = math.clamp(Config.SearchRadius, 20, 256)
+    local lo = Vector3.new(center.X - R, center.Y - 120, center.Z - R)
+    local hi = Vector3.new(center.X + R, center.Y + 120, center.Z + R)
+    local region = Region3.new(lo, hi):ExpandToGrid(4)
+    local mats, occ = workspace.Terrain:ReadVoxels(region, 4)
+    local size = mats.Size
+    local origin = region.CFrame.Position - region.Size / 2
+    local n = 0
+    for x = 1, size.X do
+        local mx, ox = mats[x], occ[x]
+        for y = 1, size.Y do
+            local my, oy = mx[y], ox[y]
+            local above = mx[y + 1]
+            for z = 1, size.Z do
+                n += 1
+                if n % 30000 == 0 then task.wait() end
+                if GrassMats[my[z]] and oy[z] > 0.5 and (not above or above[z] == Enum.Material.Air) then
+                    local p = origin + Vector3.new((x - 0.5) * 4, y * 4, (z - 0.5) * 4)
+                    local k = grassKey(p)
+                    local idx = seen[k]
+                    if not idx then
+                        pts[#pts + 1] = p
+                        seen[k] = #pts
+                    elseif p.Y > pts[idx].Y then
+                        pts[idx] = p
+                    end
+                end
+            end
+        end
+    end
+    return pts
+end
+
+-- confirms there really is grass terrain under (x, z) and returns the exact surface point
+local function grassGround(x, z, refY)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character }
+    local res = workspace:Raycast(Vector3.new(x, refY + 20, z), Vector3.new(0, -40, 0), params)
+    if res and GrassMats[res.Material] then return res.Position end
+    return nil
+end
+
+-- returns (message, fallback). fallback = true means "use the old prompt search instead"
+local function foodTerrainLoop(force, info)
+    local function active()
+        return alive and not State.Cancel and (force or State[info.flag]) and getRoot() ~= nil
+    end
+
+    if promptState() == nil then
+        Cooldown.Food = tick() + 15
+        return "eat prompt GUI not found (EatDrinkDisplayScreenGui)", false
+    end
+
+    State.Searching = true
+    refreshNoclip()
+
+    -- how high above the ground the character normally stands
+    local standOff = Config.HeightOffset
+    do
+        local r0 = getRoot()
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if r0 then
+            local g0 = groundY(r0.Position.X, r0.Position.Z, r0.Position.Y)
+            if hum and hum.FloorMaterial ~= Enum.Material.Air and g0 then
+                standOff = r0.Position.Y - g0
+            elseif hum then
+                standOff = hum.HipHeight + r0.Size.Y / 2
+            end
+        end
+    end
+
+    local root = getRoot()
+    setStatus("scanning terrain for grass...")
+    local okS, pts = pcall(scanTerrainGrass, root.Position)
+    if not okS then
+        warn("[AnimalFarm] terrain scan failed: " .. tostring(pts))
+        return "terrain scan failed", true
+    end
+    if #pts == 0 then
+        Cooldown.Food = tick() + 15
+        return "no grass terrain found nearby", true
+    end
+
+    local skip = {}
+    local best, lastProgress, promptLost = 0, tick(), nil
+    local atSpot, curKey = false, nil
+
+    local function pickTarget(from)
+        local bestP, bd
+        local now = tick()
+        for _, p in ipairs(pts) do
+            local s = skip[grassKey(p)]
+            if not (s and s > now) then
+                local d = (p - from).Magnitude
+                if not bd or d < bd then bestP, bd = p, d end
+            end
+        end
+        return bestP
+    end
+
+    -- already standing on grass with the prompt showing? eat right here
+    do
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum and GrassMats[hum.FloorMaterial] and promptOn("Food", true) then
+            startHold(root.Position)
+            atSpot = true
+            best, lastProgress = readStat("Food") or 0, tick()
+            setStatus("eating grass")
+        end
+    end
+
+    while active() do
+        local v = readStat("Food")
+        if not v then stopHold() return "can't read food stat", false end
+        if v >= Config.RefillTarget then stopHold() return "food full", false end
+        if not force and shouldYield("Food") then stopHold() return "paused food, water is low", false end
+
+        if atSpot then
+            if v > best + 0.1 then best, lastProgress = v, tick() end
+            if promptOn("Food", true) then promptLost = nil else promptLost = promptLost or tick() end
+            local lost = promptLost and tick() - promptLost > 2
+            if lost or tick() - lastProgress > Config.StallTime then
+                if curKey then skip[curKey] = tick() + 60 end
+                stopHold()
+                atSpot, curKey, promptLost = false, nil, nil
+            else
+                if canFire("Food") then fireSafe(info.fire) end
+                task.wait(Config.FireInterval)
+            end
+        else
+            local r = getRoot()
+            if not r then return "stopped", false end
+            local p = pickTarget(r.Position)
+            if not p then
+                Cooldown.Food = tick() + 15
+                return "no working grass spot found", false
+            end
+            curKey = grassKey(p)
+            local gp = grassGround(p.X, p.Z, p.Y)
+            if not gp then
+                skip[curKey] = tick() + 120
+            else
+                local target = gp + Vector3.new(0, standOff, 0)
+                setStatus(string.format("going to grass (%.0f studs)", (target - r.Position).Magnitude))
+                State.Searching = false
+                refreshNoclip()
+                local arrived = moveTo(target)
+                State.Searching = true
+                refreshNoclip()
+                if State.Cancel or not alive then stopHold() return "stopped", false end
+                if not arrived then
+                    skip[curKey] = tick() + 120
+                else
+                    startHold(target)
+                    local t = tick()
+                    while active() and tick() - t < Config.PromptWait and not promptOn("Food", true) do
+                        task.wait(0.1)
+                    end
+                    if promptOn("Food", true) then
+                        atSpot, promptLost = true, nil
+                        best, lastProgress = readStat("Food") or v, tick()
+                        LastFood = target
+                        setStatus("eating grass")
+                    else
+                        stopHold()
+                        skip[curKey] = tick() + 120
+                        setStatus("no eat prompt on this grass, trying another")
+                    end
+                end
+            end
+        end
+    end
+    stopHold()
+    return "stopped", false
+end
+
+-- ================= SHORELINE WATER (water is terrain; MainWaterPart sits ~90 studs below the map) =================
+-- Scans the terrain for water SURFACE cells, finds dry ground right next to the nearest one, teleports
+-- there and drinks while standing on the shore. It never goes into the water or underground.
+local function scanWaterSurface(center, R)
+    local cells = {}
+    local lo = Vector3.new(center.X - R, center.Y - 200, center.Z - R)
+    local hi = Vector3.new(center.X + R, center.Y + 200, center.Z + R)
+    local region = Region3.new(lo, hi):ExpandToGrid(4)
+    local mats, occ = workspace.Terrain:ReadVoxels(region, 4)
+    local size = mats.Size
+    local origin = region.CFrame.Position - region.Size / 2
+    local n = 0
+    for x = 1, size.X do
+        local mx, ox = mats[x], occ[x]
+        for y = 1, size.Y do
+            local my, oy = mx[y], ox[y]
+            local above = mx[y + 1]
+            for z = 1, size.Z do
+                n += 1
+                if n % 30000 == 0 then task.wait() end
+                if my[z] == Enum.Material.Water and oy[z] > 0.3 and (not above or above[z] == Enum.Material.Air) then
+                    cells[#cells + 1] = Vector3.new(
+                        origin.X + (x - 0.5) * 4,
+                        origin.Y + (y - 1) * 4 + oy[z] * 4,
+                        origin.Z + (z - 0.5) * 4)
+                end
+            end
+        end
+    end
+    return cells
+end
+
+-- dry ground a few studs from one water surface cell (not covered by water, about water level)
+local function shoreStandPoint(cell, skip, now)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character }
+    params.IgnoreWater = false
+    for _, rad in ipairs({ 4, 6 }) do
+        for k = 0, 7 do
+            local a = k / 8 * 2 * math.pi
+            local x, z = cell.X + math.cos(a) * rad, cell.Z + math.sin(a) * rad
+            local key = grassKey(Vector3.new(x, 0, z))
+            if not (skip[key] and skip[key] > now) then
+                local res = workspace:Raycast(Vector3.new(x, cell.Y + 8, z), Vector3.new(0, -24, 0), params)
+                if res and res.Material ~= Enum.Material.Water
+                    and res.Position.Y > cell.Y - 2 and res.Position.Y < cell.Y + 3 then
+                    return res.Position, key, cell
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- ---- water that is one big flat part (e.g. Workspace.MainWaterPart) instead of terrain water ----
+local function waterPlanes()
+    local list, seen = {}, {}
+    local function add(i)
+        if i:IsA("BasePart") and not seen[i] and i:IsDescendantOf(workspace)
+            and i.Size.X >= 400 and i.Size.Z >= 400 and i.Size.Y <= 6 then
+            seen[i] = true
+            list[#list + 1] = i
+        end
+    end
+    pcall(function()
+        for _, i in ipairs(CS:GetTagged("WaterPart")) do add(i) end
+    end)
+    for _, i in ipairs(workspace:GetChildren()) do
+        if i.Name:lower():find("water", 1, true) then add(i) end
+    end
+    return list
+end
+
+-- samples the terrain height around you on a grid; the shore is where land (at/above the water level)
+-- touches ground that is below it. Returns (groundPoint, key, pointToFace) or nil.
+local function findPlaneShore(from, skip)
+    local planes = waterPlanes()
+    if #planes == 0 then return nil end
+    local planeY, bestDy
+    for _, p in ipairs(planes) do
+        local top = p.Position.Y + p.Size.Y / 2
+        local dy = math.abs(top - from.Y)
+        if not bestDy or dy < bestDy then planeY, bestDy = top, dy end
+    end
+
+    -- rays ignore the water part and the moss/lily decoration so they reach the real ground
+    local ignore = { LocalPlayer.Character }
+    for _, p in ipairs(planes) do ignore[#ignore + 1] = p end
+    pcall(function()
+        for _, i in ipairs(CS:GetTagged("AlignWithWaterHeightModels")) do ignore[#ignore + 1] = i end
+    end)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = ignore
+    params.IgnoreWater = true
+
+    local top = math.max(planeY + 120, from.Y + 40)
+    local length = top - planeY + 60
+    local S, rays = 5, 0
+
+    local function groundAt(x, z)
+        local res = workspace:Raycast(Vector3.new(x, top, z), Vector3.new(0, -length, 0), params)
+        if res and res.Instance:IsA("Terrain") then return res.Position.Y end
+        return nil
+    end
+
+    -- "land" (+ height), "water" (no ground, or ground below the surface) or "blocked" (a non-terrain object)
+    local function probe(x, z)
+        rays += 1
+        if rays % 120 == 0 then task.wait() end
+        local res = workspace:Raycast(Vector3.new(x, top, z), Vector3.new(0, -length, 0), params)
+        if not res then return "water" end
+        if not res.Instance:IsA("Terrain") then return "blocked" end
+        if res.Position.Y < planeY - 0.3 then return "water" end
+        return "land", res.Position.Y
+    end
+
+    local cache = {}
+    local function sample(gx, gz)
+        local row = cache[gx]
+        if not row then
+            row = {}
+            cache[gx] = row
+        end
+        local e = row[gz]
+        if not e then
+            local kind, y = probe(gx * S, gz * S)
+            e = { kind = kind, y = y }
+            row[gz] = e
+        end
+        return e
+    end
+
+    setStatus(string.format("scanning for the shoreline (flat water at Y=%.1f)...", planeY))
+    local cgx, cgz = math.floor(from.X / S + 0.5), math.floor(from.Z / S + 0.5)
+    local now = tick()
+
+    for r = 0, 40 do -- square rings outward, up to ~200 studs; stop at the first ring that has a usable shore
+        local bestD, bestGP, bestKey, bestFace
+        for dx = -r, r do
+            for dz = -r, r do
+                if math.max(math.abs(dx), math.abs(dz)) == r then
+                    local d2 = dx * dx + dz * dz
+                    if not bestD or d2 < bestD then
+                        local gx, gz = cgx + dx, cgz + dz
+                        local e = sample(gx, gz)
+                        if e.kind == "land" and e.y <= planeY + 2.5 then
+                            local wgx, wgz
+                            for nx = -1, 1 do
+                                for nz = -1, 1 do
+                                    if not wgx and (nx ~= 0 or nz ~= 0) and sample(gx + nx, gz + nz).kind == "water" then
+                                        wgx, wgz = gx + nx, gz + nz
+                                    end
+                                end
+                            end
+                            if wgx then
+                                -- find the exact waterline between the land sample and its water neighbour
+                                local lx, lz, wx, wz = gx * S, gz * S, wgx * S, wgz * S
+                                local lo, hi = 0, 1
+                                for _ = 1, 5 do
+                                    local mid = (lo + hi) / 2
+                                    if probe(lx + (wx - lx) * mid, lz + (wz - lz) * mid) == "land" then
+                                        lo = mid
+                                    else
+                                        hi = mid
+                                    end
+                                end
+                                local len = math.sqrt((wx - lx) ^ 2 + (wz - lz) ^ 2)
+                                local ux, uz = (wx - lx) / len, (wz - lz) / len
+                                local ex, ez = lx + (wx - lx) * lo, lz + (wz - lz) * lo
+                                local sx = ex + ux * Config.PlaneShoreOffset
+                                local sz = ez + uz * Config.PlaneShoreOffset
+                                local gy = groundAt(sx, sz)
+                                if not gy or gy < planeY - 2.5 then -- too deep: stand right at the edge instead
+                                    sx, sz = ex, ez
+                                    gy = groundAt(sx, sz) or e.y
+                                end
+                                local gp = Vector3.new(sx, gy, sz)
+                                local key = grassKey(gp)
+                                if not (skip[key] and skip[key] > now) then
+                                    bestD, bestGP, bestKey = d2, gp, key
+                                    bestFace = Vector3.new(sx + ux * 8, planeY, sz + uz * 8)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if bestGP then return bestGP, bestKey, bestFace end
+    end
+    return nil
+end
+
+-- ---- whole-map fallback: no water within ~200 studs, so sample the map on a coarse grid, nearest first ----
+-- Works for both kinds of water: a ray that lands on Water terrain counts as water, and so does ground
+-- below a flat water part's surface. It only has to get you NEAR the shore; once you are there the
+-- precise local search above takes over.
+local function findFarShore(from, skip)
+    local maxDist = Config.WaterSearchDistance
+    local planes = waterPlanes()
+    local planeY
+    do
+        local bestDy
+        for _, p in ipairs(planes) do
+            local t = p.Position.Y + p.Size.Y / 2
+            local dy = math.abs(t - from.Y)
+            if not bestDy or dy < bestDy then planeY, bestDy = t, dy end
+        end
+    end
+
+    -- rays ignore the character, flat water parts and the moss/lily decoration
+    local ignore = { LocalPlayer.Character }
+    for _, p in ipairs(planes) do ignore[#ignore + 1] = p end
+    pcall(function()
+        for _, i in ipairs(CS:GetTagged("AlignWithWaterHeightModels")) do ignore[#ignore + 1] = i end
+    end)
+    local params = RaycastParams.new() -- counts terrain water
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = ignore
+    params.IgnoreWater = false
+    local params2 = RaycastParams.new() -- sees the ground under terrain water
+    params2.FilterType = Enum.RaycastFilterType.Exclude
+    params2.FilterDescendantsInstances = ignore
+    params2.IgnoreWater = true
+
+    local topY = from.Y + 150
+    pcall(function() topY = math.max(topY, workspace.Terrain.MaxExtents.Max.Y * 4 + 20) end)
+    topY = math.min(topY, from.Y + 1500)
+    local length = topY - (from.Y - 600)
+    local S, rays = 16, 0
+
+    local function groundAt(x, z)
+        local res = workspace:Raycast(Vector3.new(x, topY, z), Vector3.new(0, -length, 0), params2)
+        if res and res.Instance:IsA("Terrain") then return res.Position.Y end
+        return nil
+    end
+
+    -- "land" (+ height) | "water" (+ surface height, + true if it is terrain water) | "blocked" | "void"
+    local function probe(x, z)
+        rays += 1
+        if rays % 400 == 0 then task.wait() end
+        local res = workspace:Raycast(Vector3.new(x, topY, z), Vector3.new(0, -length, 0), params)
+        if not res then
+            if planeY then return "water", planeY, false end
+            return "void"
+        end
+        if not res.Instance:IsA("Terrain") then return "blocked" end
+        if res.Material == Enum.Material.Water then return "water", res.Position.Y, true end
+        if planeY and res.Position.Y < planeY - 0.3 then return "water", planeY, false end
+        return "land", res.Position.Y
+    end
+
+    local cache = {}
+    local function sample(gx, gz)
+        local row = cache[gx]
+        if not row then
+            row = {}
+            cache[gx] = row
+        end
+        local e = row[gz]
+        if not e then
+            local kind, y, terr = probe(gx * S, gz * S)
+            e = { kind = kind, y = y, terr = terr }
+            row[gz] = e
+        end
+        return e
+    end
+
+    local cgx, cgz = math.floor(from.X / S + 0.5), math.floor(from.Z / S + 0.5)
+    local maxRing = math.ceil(maxDist / S)
+    local now = tick()
+
+    for r = 0, maxRing do
+        if not alive or State.Cancel then return nil end
+        if r % 4 == 0 then
+            setStatus(string.format("searching the whole map for water (%d / %d studs out)...", r * S, maxDist))
+        end
+        local bestD, bestGP, bestKey, bestFace
+        for dx = -r, r do
+            for dz = -r, r do
+                if math.max(math.abs(dx), math.abs(dz)) == r then
+                    local d2 = dx * dx + dz * dz
+                    if not bestD or d2 < bestD then
+                        local gx, gz = cgx + dx, cgz + dz
+                        local e = sample(gx, gz)
+                        if e.kind == "land" then
+                            local wgx, wgz, we
+                            for nx = -1, 1 do
+                                for nz = -1, 1 do
+                                    if not wgx and (nx ~= 0 or nz ~= 0) then
+                                        local ne = sample(gx + nx, gz + nz)
+                                        if ne.kind == "water" then wgx, wgz, we = gx + nx, gz + nz, ne end
+                                    end
+                                end
+                            end
+                            if wgx then
+                                -- find the exact waterline between the land sample and its water neighbour
+                                local lx, lz, wx, wz = gx * S, gz * S, wgx * S, wgz * S
+                                local lo, hi, landY = 0, 1, e.y
+                                for _ = 1, 7 do
+                                    local mid = (lo + hi) / 2
+                                    local kind, y = probe(lx + (wx - lx) * mid, lz + (wz - lz) * mid)
+                                    if kind == "land" then
+                                        lo, landY = mid, y
+                                    else
+                                        hi = mid
+                                    end
+                                end
+                                local level = we.y
+                                if landY <= level + 2.5 then -- a real shore, not the top of a cliff
+                                    local len = math.sqrt((wx - lx) ^ 2 + (wz - lz) ^ 2)
+                                    local ux, uz = (wx - lx) / len, (wz - lz) / len
+                                    local ex, ez = lx + (wx - lx) * lo, lz + (wz - lz) * lo
+                                    local off = we.terr and -1.5 or Config.PlaneShoreOffset
+                                    local sx, sz = ex + ux * off, ez + uz * off
+                                    local gy = groundAt(sx, sz)
+                                    if not gy or gy < level - 2.5 or gy > level + 3 then
+                                        sx, sz, gy = ex, ez, landY
+                                    end
+                                    local gp = Vector3.new(sx, gy, sz)
+                                    local key = grassKey(gp)
+                                    if not (skip[key] and skip[key] > now) then
+                                        bestD, bestGP, bestKey = d2, gp, key
+                                        bestFace = Vector3.new(sx + ux * 8, level, sz + uz * 8)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if bestGP then return bestGP, bestKey, bestFace end
+    end
+    return nil
+end
+
+-- nearest usable shore point to `from`: returns (groundPoint, key, pointToFace) or (nil, errorMessage)
+local function findShoreTarget(from, skip)
+    for _, R in ipairs({ 48, 96, 160 }) do
+        setStatus(string.format("scanning terrain for water (%d studs)...", R))
+        local ok, cells = pcall(scanWaterSurface, from, R)
+        if not ok then
+            warn("[AnimalFarm] water scan failed: " .. tostring(cells))
+            return nil, "terrain water scan failed"
+        end
+        if #cells > 0 then
+            local rows = {}
+            for _, c in ipairs(cells) do rows[#rows + 1] = { c, (c - from).Magnitude } end
+            table.sort(rows, function(a, b) return a[2] < b[2] end)
+            local now = tick()
+            for i, row in ipairs(rows) do
+                if i % 40 == 0 then task.wait() end
+                local gp, key, cell = shoreStandPoint(row[1], skip, now)
+                if gp then return gp, key, cell end
+            end
+        end
+    end
+    -- no terrain water nearby: try games where the water is one big flat part (e.g. MainWaterPart)
+    local pgp, pkey, pface = findPlaneShore(from, skip)
+    if pgp then return pgp, pkey, pface end
+    -- nothing close by: look across the whole map and take the closest shore
+    local fgp, fkey, fface = findFarShore(from, skip)
+    if fgp then return fgp, fkey, fface end
+    return nil, string.format("no water found within %d studs", Config.WaterSearchDistance)
+end
+
+local function waterShoreLoop(force, info)
+    local function active()
+        return alive and not State.Cancel and (force or State[info.flag]) and getRoot() ~= nil
+    end
+
+    State.Searching = true -- noclip only while travelling, never while standing at the shore
+    refreshNoclip()
+
+    -- Preserve the original character-size-aware grounded offset.
+    local standOff = Config.HeightOffset
+    do
+        local r0 = getRoot()
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if r0 then
+            local g0 = groundY(r0.Position.X, r0.Position.Z, r0.Position.Y)
+            if hum and hum.FloorMaterial ~= Enum.Material.Air and g0 then
+                standOff = r0.Position.Y - g0
+            elseif hum then
+                standOff = hum.HipHeight + r0.Size.Y / 2
+            end
+        end
+    end
+
+    local skip, fails = {}, 0
+    local best, lastProgress = 0, tick()
+    local atSpot, curKey = false, nil
+
+    while active() do
+        local v = readStat("Water")
+        if not v then stopHold() return "can't read water stat" end
+        if v >= Config.RefillTarget then stopHold() return "water full" end
+        if not force and shouldYield("Water") then stopHold() return "paused water, food is low" end
+
+        if atSpot then
+            if v > best + 0.1 then best, lastProgress = v, tick() end
+            if tick() - lastProgress > Config.StallTime then
+                if curKey then skip[curKey] = tick() + 90 end
+                stopHold()
+                atSpot, curKey = false, nil
+            else
+                if canFire("Water") then fireSafe(info.fire) end
+                task.wait(Config.FireInterval)
+            end
+        else
+            if fails >= 8 then
+                Cooldown.Water = tick() + 30
+                return "gave up, no shore spot let me drink"
+            end
+            local r = getRoot()
+            if not r then return "stopped" end
+            local gp, key, cell = findShoreTarget(r.Position, skip)
+            if not gp then
+                Cooldown.Water = tick() + 15
+                return key or "no shoreline found"
+            end
+            curKey = key
+            local target = gp + Vector3.new(0, standOff, 0)
+            setStatus(string.format("going to the shore (%.0f studs)", (target - r.Position).Magnitude))
+            State.Searching = false
+            refreshNoclip()
+            local arrived = moveTo(target)
+            State.Searching = true
+            refreshNoclip()
+            if State.Cancel or not alive then stopHold() return "stopped" end
+            if not arrived then
+                skip[key] = tick() + 120
+                fails += 1
+            else
+                -- the game cancels drinking unless you are looking at the water, so face the nearest water cell
+                local face
+                if Config.FaceWater and cell then
+                    face = Vector3.new(cell.X, Config.TiltToWater and cell.Y or target.Y, cell.Z)
+                end
+                startHold(target, face)
+                LastWaterPos = target
+                -- the prompt text can linger, so the real check is: does the water bar rise here?
+                local base = readStat("Water") or v
+                local t0, rose = tick(), false
+                while active() and tick() - t0 < math.max(Config.PromptWait, 2.5) do
+                    if canFire("Water") then fireSafe(info.fire) end
+                    task.wait(Config.FireInterval)
+                    local nv = readStat("Water")
+                    if nv and nv > base + 0.1 then rose = true break end
+                end
+                if rose then
+                    atSpot = true
+                    best, lastProgress = readStat("Water") or v, tick()
+                    setStatus("drinking at the shore")
+                else
+                    stopHold()
+                    skip[key] = tick() + 120
+                    fails += 1
+                    setStatus("can't drink here, trying another spot")
+                end
+            end
+        end
+    end
+    stopHold()
+    return "stopped"
+end
+
+-- panic button: stop everything and put you on dry ground next to the nearest water
+local function rescueToShore()
+    if State.GoingHome then return end
+    if State.Busy then
+        State.Cancel = true
+        local t = tick()
+        while State.Busy and tick() - t < 10 and alive do task.wait(0.1) end
+    end
+    State.GoingHome = true
+    State.Busy, State.Cancel, State.InCycle, State.Searching = true, false, true, false
+    refreshNoclip()
+    pcall(function()
+        stopHold()
+        local r = getRoot()
+        if not r then return end
+        local gp = findShoreTarget(r.Position, {})
+        if not gp then
+            setStatus("rescue: no shore found nearby")
+            return
+        end
+        setStatus("rescue: moving to the shore")
+        local target = gp + Vector3.new(0, Config.HeightOffset, 0)
+        moveTo(target, true)
+        r = getRoot()
+        if r then r.CFrame = CFrame.new(target) * (r.CFrame - r.CFrame.Position) end
+        setStatus("rescue: standing on the shore")
+    end)
+    WaterOrigin, LastWaterPos = nil, nil
+    State.Busy, State.InCycle = false, false
+    refreshNoclip()
+    State.GoingHome = false
+end
+
+-- ================= REFILL CYCLE =================
+local function nearestGrassVector(from)
+    local best, bestDistance
+    local function consider(pos)
+        if typeof(pos) ~= "Vector3" then return end
+        local distance = (pos - from).Magnitude
+        if not bestDistance or distance < bestDistance then best, bestDistance = pos, distance end
+    end
+
+    consider(LastFood)
+    for _, spot in ipairs(Spots.Food) do consider(spot.pos) end
+
+    local root = getRoot()
+    local character = LocalPlayer.Character
+    local hum = character and character:FindFirstChildOfClass("Humanoid")
+    if root then
+        local standOff = hum and (hum.HipHeight + root.Size.Y / 2) or 3
+        local ok, grassPoints = pcall(scanTerrainGrass, from)
+        if ok then
+            for _, point in ipairs(grassPoints) do
+                local ground = grassGround(point.X, point.Z, point.Y)
+                if ground then consider(ground + Vector3.new(0, standOff, 0)) end
+            end
+        end
+    end
+    if best then LastFood = best end
+    return best
+end
+
+local function runCycle(kind, force)
+    if State.Busy or State.GoingHome then return end
+    local info = Kinds[kind]
+    State.Busy, State.Cancel, State.InCycle = true, false, true
+    refreshNoclip()
+
+    local origin
+    do
+        local r = getRoot()
+        origin = r and r.CFrame
+    end
+    if kind == "Water" then markWaterStart() end
+    if kind == "Water" and Config.WaterMode == "Shoreline" then
+        -- never "return" to a spot that is in the water
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if (char and char:GetAttribute("MovementState") == "Swimming")
+            or (hum and hum:GetState() == Enum.HumanoidStateType.Swimming) then
+            origin, WaterOrigin, LastWaterPos = nil, nil, nil
+        end
+    end
+
+    local finalMsg
+    local ok, err = pcall(function()
+        if kind == "Food" and Config.FoodMode == "Terrain Grass" then
+            local msg, fallback = foodTerrainLoop(force, info)
+            if not fallback then
+                finalMsg = msg
+                return
+            end
+            setStatus(msg .. ", using prompt search")
+        end
+        if kind == "Food" and (Config.FoodMode == "Prompt Search" or Config.FoodMode == "Terrain Grass") then
+            finalMsg = foodPromptLoop(force, info)
+            return
+        end
+        if kind == "Water" and Config.WaterMode == "Shoreline" then
+            finalMsg = waterShoreLoop(force, info)
+            return
+        end
+        local fails, cur, best, lastProgress = 0, nil, 0, tick()
+        local promptLost = nil
+
+        local function active()
+            return alive and not State.Cancel and (force or State[info.flag]) and getRoot() ~= nil
+        end
+
+        -- drop the current source and remember it was bad
+        local function reject(seconds, countBad)
+            Blacklist[kind][cur.key] = tick() + seconds
+            if countBad and cur.inst and not cur.gotProgress then
+                nameStat(kind, learnKey(cur.inst)).bad += 1
+            end
+            cur = nil
+            promptLost = nil
+            fails += 1
+        end
+
+        while active() do
+            local v = readStat(info.stat)
+            if not v then
+                finalMsg = "can't read " .. kind:lower() .. " stat"
+                break
+            end
+            if v >= Config.RefillTarget then
+                finalMsg = kind:lower() .. " full"
+                break
+            end
+            if not force and shouldYield(kind) then
+                finalMsg = "paused " .. kind:lower() .. ", other stat is low"
+                break
+            end
+
+            -- current source got used up (grass disappears)
+            if cur and cur.inst and not cur.inst:IsDescendantOf(workspace) then
+                cur = nil
+                promptLost = nil
+            end
+
+            -- stat stopped rising: this source isn't working
+            if cur and tick() - lastProgress > Config.StallTime then
+                reject(60, true)
+            end
+
+            -- prompt vanished while refilling (patch eaten / walked off): switch
+            if cur and Config.VerifyPrompt then
+                if promptOn(kind, false) then
+                    promptLost = nil
+                else
+                    promptLost = promptLost or tick()
+                    if tick() - promptLost > 2 then
+                        reject(20, false)
+                    end
+                end
+            end
+
+            if fails >= 8 then
+                finalMsg = "gave up, no " .. kind:lower() .. " source worked"
+                Cooldown[kind] = tick() + 30
+                break
+            end
+
+            if not cur then
+                stopHold()
+                setStatus("looking for " .. kind:lower() .. " source...")
+                cur = findNearest(kind)
+                if not cur then
+                    finalMsg = "no " .. kind:lower() .. " source found"
+                    Cooldown[kind] = tick() + 15
+                    break
+                end
+                setStatus(string.format("going to %s (%.0f studs)", cur.name, cur.dist))
+                if not moveTo(cur.pos) then break end
+                if kind == "Water" then LastWaterPos = cur.pos end
+                startHold(cur.pos)
+
+                -- ground truth: does the game actually show the eat/drink prompt here?
+                if Config.VerifyPrompt then
+                    local t = tick()
+                    while alive and not State.Cancel and tick() - t < Config.PromptWait
+                        and not promptOn(kind, false) do
+                        task.wait(0.1)
+                    end
+                    if not promptOn(kind, false) then
+                        setStatus("no prompt at " .. cur.name .. ", skipping")
+                        reject(120, true)
+                        stopHold()
+                        continue
+                    end
+                end
+
+                best = readStat(info.stat) or v
+                lastProgress = tick()
+                setStatus("refilling " .. kind:lower() .. " at " .. cur.name)
+            else
+                if v > best + 0.1 then
+                    best = v
+                    lastProgress = tick()
+                    if cur.inst and not cur.gotProgress then
+                        cur.gotProgress = true
+                        nameStat(kind, learnKey(cur.inst)).good += 1
+                    end
+                end
+            end
+
+            if canFire(kind) then fireSafe(info.fire) end
+            task.wait(Config.FireInterval)
+        end
+    end)
+
+    if not ok then
+        finalMsg = "error: " .. tostring(err)
+        warn("[AnimalFarm] " .. tostring(err))
+    end
+
+    pcall(function()
+        stopHold()
+        local r = getRoot()
+        if kind == "Water" and (readStat("Water") or 0) >= Config.RefillTarget and r then
+            local grassTarget = nearestGrassVector(r.Position)
+            if grassTarget then
+                setStatus("returning to nearest grass")
+                moveTo(grassTarget, true)
+                r = getRoot()
+                if r then
+                    r.CFrame = CFrame.new(grassTarget) * (r.CFrame - r.CFrame.Position)
+                    r.AssemblyLinearVelocity = Vector3.zero
+                end
+            else
+                setStatus("no known grass vector found")
+            end
+            WaterOrigin, LastWaterPos = nil, nil
+        elseif kind ~= "Water" and State.ReturnBack and origin and r and not (kind == "Food" and not State.ReturnFood) then
+            setStatus("returning")
+            moveTo(origin.Position, true)
+            r = getRoot()
+            if r then r.CFrame = origin end
+            if kind == "Water" then WaterOrigin, LastWaterPos = nil, nil end
+        end
+    end)
+
+    stopHold()
+    State.Busy, State.InCycle, State.Searching = false, false, false
+    refreshNoclip()
+    setStatus(finalMsg or "idle")
+end
+
+-- called when Auto Drink is switched off: leave the drinking state and
+-- go back to the ground spot you started from
+local function releaseWater()
+    if State.GoingHome then return end
+    local t = tick()
+    while State.Busy and tick() - t < 8 and alive do task.wait(0.1) end
+    if State.Busy or State.GoingHome then return end
+    if State.Drinking then return end -- Auto Drink was turned back on
+    State.GoingHome = true
+    State.Busy, State.Cancel, State.InCycle, State.Searching = true, false, true, false
+    refreshNoclip()
+    pcall(function()
+        stopHold()
+        -- "stop drinking" showing means we're still in the drinking state: press it once to stop
+        if promptStop("Water") then
+            pcall(Kinds.Water.fire)
+            task.wait(0.3)
+        end
+        -- Auto Drink no longer returns to the saved starting position.
+    end)
+    WaterOrigin, LastWaterPos = nil, nil
+    State.Busy, State.InCycle = false, false
+    refreshNoclip()
+    State.GoingHome = false
+    setStatus("idle")
+end
+
+-- scheduler
+task.spawn(function()
+    while alive and task.wait(1) do
+        if not State.Busy and not State.GoingHome then
+            local w, f = readStat("Water"), readStat("Food")
+            local queue = {}
+            if State.Drinking and w and w < Config.RefillStart and tick() > Cooldown.Water then
+                table.insert(queue, { "Water", w })
+            end
+            if State.Eating and f and f < Config.RefillStart and tick() > Cooldown.Food then
+                table.insert(queue, { "Food", f })
+            end
+            table.sort(queue, function(a, b) return a[2] < b[2] end)
+            if queue[1] then
+                local okc, errc = pcall(runCycle, queue[1][1], false)
+                if not okc then
+                    warn("[AnimalFarm] cycle error: " .. tostring(errc))
+                    State.Busy, State.InCycle, State.Searching = false, false, false
+                    stopHold()
+                    refreshNoclip()
+                end
+            elseif (State.Eating or State.Drinking) and (Status == "idle" or Status:find("full$") or Status:find("^paused")) then
+                setStatus(string.format("waiting, refills below %d%%", Config.RefillStart))
+            end
+        end
+    end
+end)
+
+-- ================= UI =================
+-- (no ToggleKey here: the minimize key is handled by the Menu tab, default Right Alt)
+local Window = WindUI:CreateWindow({
+    Title = "Stimmy Hub",
+    Size = UDim2.fromOffset(580, 460),
+    Theme = "Dark",
+})
+
+-- ================= CONFIG SAVE SYSTEM =================
+local HttpService = game:GetService("HttpService")
+local FS_OK = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+local DIR = "StimmyHub"
+local Values, Elements = {}, {}
+local HitSafe, AuraSafe, refreshHitList, refreshAuraList
+local applyConfigMinKey, applyConfigAuraKey
+local ConfigReady = false
+local ConfigName, SelectedAutoConfig = "", ""
+local LoadedConfigName, AutoConfigName = "", ""
+local ConfigDropdown
+local saveConfigPrefs
+
+-- Wrap controls so each setting can be saved in a named config.
+-- wraps Toggle / Slider / Input / Dropdown so every element that has a Flag is tracked for configs
+local function hook(tab)
+    for _, kind in ipairs({ "Toggle", "Slider", "Input", "Dropdown" }) do
+        local orig = tab[kind]
+        tab[kind] = function(self, cfg)
+            local flag = cfg.Flag
+            cfg.Flag = nil
+            local cb = cfg.Callback
+            if flag then
+                local init
+                if kind == "Slider" then
+                    init = type(cfg.Value) == "table" and cfg.Value.Default or nil
+                else
+                    init = cfg.Value
+                end
+                if init ~= nil then Values[flag] = init end
+                cfg.Callback = function(v)
+                    if v ~= nil then Values[flag] = v end
+                    if cb then return cb(v) end
+                end
+            end
+            local el = orig(self, cfg)
+            if flag and type(el) == "table" then
+                Elements[flag] = { el = el, call = cfg.Callback, kind = kind }
+            end
+            return el
+        end
+    end
+end
+
+local function setLabel(lbl, text)
+    if lbl then pcall(function() lbl:SetTitle(text) end) end
+end
+
+local function sanitizeName(n)
+    n = tostring(n or ""):gsub("[^%w_%- ]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+    n = n:sub(1, 40)
+    if n == "" then return nil end
+    return n
+end
+
+local function configPath(name) return DIR .. "/config_" .. name .. ".json" end
+local function configPrefsPath() return DIR .. "/auto_load_" .. tostring(LocalPlayer.UserId) .. ".json" end
+local function legacyConfigPrefsPath() return DIR .. "/auto_load_" .. tostring(LocalPlayer.UserId) .. ".txt" end
+local function oldProfilePrefsPath() return DIR .. "/config_prefs_" .. tostring(LocalPlayer.UserId) .. ".json" end
+local function priorConfigPrefsPath() return DIR .. "/prefs_" .. tostring(LocalPlayer.UserId) .. ".json" end
+local function serverSafePath()
+    local job = tostring(game.JobId or "")
+    if job == "" then return nil end
+    return DIR .. "/safe_" .. job .. ".json"
+end
+
+local function ensureDir()
+    if makefolder and isfolder and not isfolder(DIR) then pcall(makefolder, DIR) end
+end
+
+local function notify(title, content)
+    pcall(function() WindUI:Notify({ Title = title, Content = content, Duration = 4 }) end)
+end
+
+local function v3t(v) return v and { x = v.X, y = v.Y, z = v.Z } or nil end
+local function tv3(t) return (type(t) == "table" and t.x and t.y and t.z) and Vector3.new(t.x, t.y, t.z) or nil end
+
+local function snapshot()
+    local vals = {}
+    for flag, v in pairs(Values) do vals[flag] = v end
+    local function spotList(list)
+        local out = {}
+        for _, sp in ipairs(list) do out[#out + 1] = v3t(sp.pos) end
+        return out
+    end
+    return { version = 4, saved = os.time(), values = vals,
+        spots = { Food = spotList(Spots.Food), Water = spotList(Spots.Water) } }
+end
+
+local function saveConfig(name, silent)
+    if not FS_OK then
+        if not silent then notify("No file access", "Config saving is unavailable") end
+        return false
+    end
+    name = sanitizeName(name)
+    if not name then
+        if not silent then notify("Config name required", "Enter a config name first") end
+        return false
+    end
+    ensureDir()
+    local data = snapshot()
+    data.autoLoadConfig = AutoConfigName == name
+    local ok, json = pcall(function() return HttpService:JSONEncode(data) end)
+    if not ok then return false end
+    local okw, err = pcall(writefile, configPath(name), json)
+    if not okw then if not silent then notify("Save failed", tostring(err)) end; return false end
+    SelectedAutoConfig = name
+    LoadedConfigName = name
+    if saveConfigPrefs then saveConfigPrefs() end
+    if not silent then notify("Config saved", name) end
+    return true
+end
+
+local function loadConfig(name, silent)
+    if not FS_OK then
+        if not silent then notify("No file access", "Config loading is unavailable") end
+        return false
+    end
+    name = sanitizeName(name)
+    if not name or not isfile(configPath(name)) then
+        if not silent then notify("Config not found", tostring(name or "")) end
+        return false
+    end
+    local okr, raw = pcall(readfile, configPath(name))
+    local okd, data = false, nil
+    if okr then okd, data = pcall(function() return HttpService:JSONDecode(raw) end) end
+    if not okd or type(data) ~= "table" then
+        if not silent then notify("Config load failed", "The config file is unreadable") end
+        return false
+    end
+    for flag, v in pairs(data.values or {}) do
+        if flag == "MinKey" and applyConfigMinKey then
+            pcall(applyConfigMinKey, v)
+        elseif flag == "KillAuraKey" and applyConfigAuraKey then
+            pcall(applyConfigAuraKey, v)
+        else
+            local e = Elements[flag]
+            if e then
+                pcall(function() if e.kind == "Dropdown" then e.el:Select(v) else e.el:Set(v) end end)
+                if Values[flag] ~= v then Values[flag] = v; pcall(e.call, v) end
+            end
+        end
+    end
+    if type(data.spots) == "table" then
+        for _, kind in ipairs({ "Food", "Water" }) do
+            Spots[kind] = {}
+            for _, item in ipairs(data.spots[kind] or {}) do
+                local pos = tv3(item)
+                if pos then table.insert(Spots[kind], { pos = pos }) end
+            end
+        end
+        Cache.Food.t, Cache.Water.t = 0, 0
+    end
+    SelectedAutoConfig = name
+    LoadedConfigName = name
+    if saveConfigPrefs then saveConfigPrefs() end
+    if not silent then notify("Config loaded", name) end
+    return true
+end
+
+local function listConfigs()
+    local out, seen = {}, {}
+    if FS_OK and listfiles and isfolder and isfolder(DIR) then
+        local ok, files = pcall(listfiles, DIR)
+        if ok and type(files) == "table" then
+            for _, f in ipairs(files) do
+                local name = tostring(f):match("config_([^/\\]+)%.json$")
+                if name and not name:match("^prefs_") and not seen[name] then seen[name] = true; out[#out + 1] = name end
+            end
+        end
+    end
+    table.sort(out, function(x, y) return x:lower() < y:lower() end)
+    return out
+end
+
+local function writeAutoLoadMarker(name, enabled)
+    if not name or name == "" or not isfile(configPath(name)) then return false end
+    local okr, raw = pcall(readfile, configPath(name))
+    if not okr then return false end
+    local okd, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not okd or type(data) ~= "table" then return false end
+    data.autoLoadConfig = enabled == true
+    local oke, encoded = pcall(function() return HttpService:JSONEncode(data) end)
+    if not oke then return false end
+    local okw = pcall(writefile, configPath(name), encoded)
+    if not okw then return false end
+    local okv, check = pcall(readfile, configPath(name))
+    if not okv then return false end
+    local okj, verified = pcall(function() return HttpService:JSONDecode(check) end)
+    return okj and type(verified) == "table" and verified.autoLoadConfig == (enabled == true)
+end
+
+local function findMarkedAutoLoadConfig()
+    for _, name in ipairs(listConfigs()) do
+        local ok, raw = pcall(readfile, configPath(name))
+        if ok then
+            local decoded, data = pcall(function() return HttpService:JSONDecode(raw) end)
+            if decoded and type(data) == "table" and data.autoLoadConfig == true then return name end
+        end
+    end
+    return ""
+end
+
+saveConfigPrefs = function()
+    if not FS_OK then return false end
+    ensureDir()
+    local payload = HttpService:JSONEncode({ name = AutoConfigName or "" })
+    local ok, err = pcall(writefile, configPrefsPath(), payload)
+    if not ok then
+        warn("[StimmyHub] auto-load preference save failed: " .. tostring(err))
+        return false
+    end
+    local readOk, saved = pcall(readfile, configPrefsPath())
+    if not readOk or saved ~= payload then
+        warn("[StimmyHub] auto-load preference could not be verified")
+        return false
+    end
+    return true
+end
+
+local function loadConfigPrefs()
+    if not FS_OK then return end
+    local current = configPrefsPath()
+    local oldPaths = { legacyConfigPrefsPath(), oldProfilePrefsPath(), priorConfigPrefsPath() }
+    if isfile(current) then
+        local ok, raw = pcall(readfile, current)
+        if ok then
+            local decoded, data = pcall(function() return HttpService:JSONDecode(raw) end)
+            if decoded and type(data) == "table" then AutoConfigName = sanitizeName(data.name) or "" end
+        end
+    else
+        for _, path in ipairs(oldPaths) do
+            if isfile(path) then
+                local ok, raw = pcall(readfile, path)
+                if ok then
+                    local decoded, data = pcall(function() return HttpService:JSONDecode(raw) end)
+                    if decoded and type(data) == "table" then
+                        AutoConfigName = sanitizeName(data.name or data.autoLoadConfig)
+                            or ((data.autoLoad == true) and sanitizeName(data.selected) or nil) or ""
+                    else
+                        AutoConfigName = sanitizeName(raw) or ""
+                    end
+                end
+                break
+            end
+        end
+        SelectedAutoConfig = AutoConfigName
+        saveConfigPrefs()
+    end
+    if AutoConfigName == "" then
+        AutoConfigName = findMarkedAutoLoadConfig()
+        if AutoConfigName ~= "" then SelectedAutoConfig = AutoConfigName; saveConfigPrefs() end
+    end
+    if type(delfile) == "function" then
+        for _, path in ipairs(oldPaths) do if isfile(path) then pcall(delfile, path) end end
+    end
+end
+
+local function saveServerSafeLists()
+    local path = serverSafePath()
+    if not path or not FS_OK or type(HitSafe) ~= "table" or type(AuraSafe) ~= "table" then return end
+    ensureDir()
+    local function names(list)
+        local out = {}
+        for name, enabled in pairs(list) do if enabled then out[#out + 1] = name end end
+        table.sort(out, function(x, y) return x:lower() < y:lower() end)
+        return out
+    end
+    pcall(writefile, path, HttpService:JSONEncode({ Hitbox = names(HitSafe), KillAura = names(AuraSafe) }))
+end
+
+local function loadServerSafeLists()
+    local path = serverSafePath()
+    if not path or not FS_OK or not isfile(path) then return end
+    local ok, raw = pcall(readfile, path)
+    if not ok then return end
+    local decoded, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not decoded or type(data) ~= "table" then return end
+    local function restore(target, saved)
+        if type(target) ~= "table" or type(saved) ~= "table" then return end
+        for _, name in ipairs(saved) do
+            if type(name) == "string" and name ~= "" then
+                local player = Players:FindFirstChild(name)
+                if player and player ~= LocalPlayer then target[name] = true end
+            end
+        end
+    end
+    restore(HitSafe, data.Hitbox); restore(AuraSafe, data.KillAura)
+    if refreshHitList then pcall(refreshHitList) end
+    if refreshAuraList then pcall(refreshAuraList) end
+end
+
+local function parseSize(text, lo, hi, default)
+    local cleaned = tostring(text):gsub("[^%d%.]", "")
+    local n = tonumber(cleaned)
+    if not n then return default end
+    return math.clamp(n, lo, hi)
+end
+
+
+-- ================= TAB: COMBAT (hitbox expander + kill aura) =================
+local HitboxCleanup
+do
+    local CombatTab = Window:Tab({ Title = "Combat", Icon = "swords" })
+    hook(CombatTab)
+
+    -- ---------- infinite stamina & oxygen: the client can set both directly and they stick (confirmed live) ----------
+    local InfStam = { on = false }
+    local InfOxy = { on = false }
+    local function applyInfStam()
+        local char = LocalPlayer.Character
+        if char then pcall(function() char:SetAttribute("Stamina", 100) end) end
+    end
+    local function applyInfOxy()
+        local char = LocalPlayer.Character
+        if char then pcall(function() char:SetAttribute("Oxygen", 100) end) end
+    end
+    local combatVitalsConn = RunService.Heartbeat:Connect(function()
+        if InfStam.on then applyInfStam() end
+        if InfOxy.on then applyInfOxy() end
+    end)
+
+
+    CombatTab:Section({ Title = "Infinite Stamina & Oxygen" })
+
+    CombatTab:Toggle({
+        Title = "Infinite Stamina",
+        Value = false,
+        Flag = "InfiniteStaminaOn",
+        Callback = function(v)
+            InfStam.on = v
+            if v then applyInfStam() end
+        end,
+    })
+
+    CombatTab:Toggle({
+        Title = "Infinite Oxygen",
+        Value = false,
+        Flag = "InfiniteOxygenOn",
+        Callback = function(v)
+            InfOxy.on = v
+            if v then applyInfOxy() end
+        end,
+    })
+
+    -- ---------- shared: a searchable multi-select "safe" list of player names ----------
+
+    local function newWhitelist(title, onAdded)
+        local Safe = {}
+        local shown = {}
+        local muteUntil = 0
+        local dd
+
+        local function names()
+            local rows, seen = {}, {}
+            for _, pl in ipairs(Players:GetPlayers()) do
+                if pl ~= LocalPlayer then
+                    rows[#rows + 1] = pl.Name
+                    seen[pl.Name] = true
+                end
+            end
+            for n in pairs(Safe) do
+                if not seen[n] then rows[#rows + 1] = n end
+            end
+            table.sort(rows, function(x, y) return x:lower() < y:lower() end)
+            return rows
+        end
+
+        local function refresh()
+            shown = names()
+            muteUntil = tick() + 0.5 -- ignore the callbacks our own Refresh / Select causes
+            pcall(function() dd:Refresh(shown, true) end)
+            local sel = {}
+            for _, n in ipairs(shown) do
+                if Safe[n] then sel[#sel + 1] = n end
+            end
+            pcall(function() dd:Select(sel) end)
+        end
+
+        local function persist()
+            if ConfigReady then task.defer(saveServerSafeLists) end
+        end
+
+        local function onSelect(opt)
+            if tick() < muteUntil then return end
+            local changed = false
+            if type(opt) == "table" then
+                local sel = {}
+                for _, v in pairs(opt) do
+                    local n = type(v) == "table" and (v.Title or v.Name) or v
+                    if type(n) == "string" then sel[n] = true end
+                end
+                for n in pairs(sel) do
+                    if not Safe[n] then
+                        Safe[n] = true
+                        changed = true
+                        if onAdded then onAdded(n) end
+                    end
+                end
+                for _, n in ipairs(shown) do
+                    if not sel[n] and Safe[n] then
+                        Safe[n] = nil
+                        changed = true
+                    end
+                end
+            elseif type(opt) == "string" and opt ~= "" then
+                if Safe[opt] then
+                    Safe[opt] = nil
+                    changed = true
+                else
+                    Safe[opt] = true
+                    changed = true
+                    if onAdded then onAdded(opt) end
+                end
+            end
+            if changed then persist() end
+        end
+
+        shown = names()
+        dd = CombatTab:Dropdown({
+            Title = title,
+            Values = shown,
+            Value = {},
+            Multi = true,
+            AllowNone = true,
+            SearchBarEnabled = true,
+            Callback = onSelect,
+        })
+
+        return Safe, refresh
+    end
+
+    -- ---------- hitbox expander ----------
+    local Hit = { on = false, mult = 5 }
+    local Hitboxes, origGetDefs, origGetReach = nil, nil, nil
+    local ScaledCache = setmetatable({}, { __mode = "k" }) -- [original definitions] = { mult, list }
+
+    -- Hitbox and aura safe lists are declared above for additive sync.
+
+    local function isHitSafe(char)
+        local pl = Players:GetPlayerFromCharacter(char)
+        return pl ~= nil and HitSafe[pl.Name] == true
+    end
+
+    local function getHitboxes()
+        if Hitboxes then return Hitboxes end
+        local ok, mod = pcall(function()
+            local shared = RS:WaitForChild("AnimalGameFrameworkShared", 5)
+            return require(shared:WaitForChild("Hitboxes", 5))
+        end)
+        if ok and type(mod) == "table" then Hitboxes = mod end
+        return Hitboxes
+    end
+
+    -- a copy of a definitions list with every size (and anchor radius) multiplied; cached so the game sees a
+    -- stable table while the multiplier does not change
+    local function scaledDefs(defs)
+        local c = ScaledCache[defs]
+        if c and c.mult == Hit.mult then return c.list end
+        local list = {}
+        for i, d in ipairs(defs) do
+            local copy = {}
+            for k, v in pairs(d) do copy[k] = v end
+            if typeof(d.Size) == "Vector3" then copy.Size = d.Size * Hit.mult end
+            if type(d.AnchorRadius) == "number" then copy.AnchorRadius = d.AnchorRadius * Hit.mult end
+            list[i] = copy
+        end
+        ScaledCache[defs] = { mult = Hit.mult, list = list }
+        return list
+    end
+
+    local function installOverrides()
+        local H = Hitboxes
+        pcall(function() if setreadonly then setreadonly(H, false) end end)
+        if not origGetDefs then origGetDefs = H.GetDefinitions end
+        if not origGetReach then origGetReach = H.GetReach end
+        local gd, gr = origGetDefs, origGetReach
+        return pcall(function()
+            H.GetDefinitions = function(char, ...)
+                local defs = gd(char, ...)
+                if Hit.on and Hit.mult > 1 and type(defs) == "table" and typeof(char) == "Instance"
+                    and char ~= LocalPlayer.Character and not isHitSafe(char) then
+                    return scaledDefs(defs)
+                end
+                return defs
+            end
+            H.GetReach = function(char, ...)
+                local r = gr(char, ...)
+                if r and Hit.on and typeof(char) == "Instance"
+                    and char ~= LocalPlayer.Character and not isHitSafe(char) then
+                    return r * Hit.mult
+                end
+                return r
+            end
+        end)
+    end
+
+    local function removeOverrides()
+        local H = Hitboxes
+        if H then
+            pcall(function() if setreadonly then setreadonly(H, false) end end)
+            if origGetDefs then pcall(function() H.GetDefinitions = origGetDefs end) end
+            if origGetReach then pcall(function() H.GetReach = origGetReach end) end
+        end
+        origGetDefs, origGetReach = nil, nil
+        ScaledCache = setmetatable({}, { __mode = "k" })
+    end
+
+
+    CombatTab:Section({ Title = "Hitbox Expander" })
+
+    local HitToggle
+    HitToggle = CombatTab:Toggle({
+        Title = "Hitbox Expander",
+        Value = false,
+        Flag = "HitboxOn",
+        Callback = function(v)
+            if not v then
+                Hit.on = false
+                removeOverrides()
+                return
+            end
+            task.spawn(function()
+                if not getHitboxes() then
+                    notify("Hitbox expander", "Couldn't load the game's Hitboxes module (needs an executor with require).")
+                    pcall(function() HitToggle:Set(false) end)
+                    return
+                end
+                if not installOverrides() then
+                    notify("Hitbox expander", "The game's module is read-only here, can't enlarge hitboxes.")
+                    removeOverrides()
+                    pcall(function() HitToggle:Set(false) end)
+                    return
+                end
+                Hit.on = true
+            end)
+        end,
+    })
+
+    CombatTab:Slider({
+        Title = "Hitbox Size Multiplier",
+        Step = 1,
+        Value = { Min = 1, Max = 30, Default = Hit.mult },
+        Flag = "HitboxMult",
+        Callback = function(v) Hit.mult = math.clamp(v, 1, 30) end,
+    })
+
+    HitSafe, refreshHitList = newWhitelist("Hitbox Safe Whitelist", function(name)
+        if AuraSafe and not AuraSafe[name] then
+            AuraSafe[name] = true
+            if refreshAuraList then refreshAuraList() end
+        end
+    end)
+
+    -- ---------- kill aura: fully independent of the Hitbox Expander and the game's own reach check ----------
+    -- Picks a target itself (within a fixed range, by priority) and fires the attack remote directly,
+    -- the same remote the game's own attack sends (AttackHandlerRemoteEvent:FireServer(humanoid)).
+    -- No animation, no sound: just the server report, same as Auto Eat/Drink skip their animations.
+    local AURA_RANGE = 30 -- fixed, not adjustable
+    local Aura = { on = false, delay = 0.5 }
+    -- Aura safe list is created below Kill Aura Priority.
+    local AttackHandlerRemoteEvent
+
+    local function getAttackRemote()
+        if AttackHandlerRemoteEvent then return AttackHandlerRemoteEvent end
+        local ok, remote = pcall(function() return RS:WaitForChild("AttackHandlerRemoteEvent", 5) end)
+        if ok then AttackHandlerRemoteEvent = remote end
+        return AttackHandlerRemoteEvent
+    end
+
+    local PRIORITY_KEYS = { "Closest", "Lowest HP", "Highest HP" }
+    local Priority = { "Closest" } -- ordered, up to 2; first is primary sort, second breaks ties
+
+    local function keyValue(c, key)
+        if key == "Closest" then return c.dist end
+        if key == "Lowest HP" then return c.hp end
+        if key == "Highest HP" then return -c.hp end
+        return 0
+    end
+
+    local function pickAuraTarget()
+        local myRoot = getRoot()
+        if not myRoot then return nil end
+        local candidates = {}
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if pl ~= LocalPlayer and not AuraSafe[pl.Name] then
+                local char = pl.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                if root and hum and hum.Health > 0 then
+                    local d = (root.Position - myRoot.Position).Magnitude
+                    if d <= AURA_RANGE then
+                        candidates[#candidates + 1] = { hum = hum, dist = d, hp = hum.Health }
+                    end
+                end
+            end
+        end
+        if #candidates == 0 then return nil end
+        table.sort(candidates, function(a, b)
+            for _, key in ipairs(Priority) do
+                local va, vb = keyValue(a, key), keyValue(b, key)
+                if va ~= vb then return va < vb end
+            end
+            return a.dist < b.dist
+        end)
+        return candidates[1].hum
+    end
+
+    local function auraStep()
+        local remote = getAttackRemote()
+        if not remote then return end
+        local hum = pickAuraTarget()
+        if hum then
+            remote:FireServer(hum)
+        end
+    end
+
+    task.spawn(function()
+        while alive do
+            task.wait(math.max(0.05, Aura.delay))
+            if Aura.on then
+                local ok, err = pcall(auraStep)
+                if not ok then warn("[AnimalFarm] kill aura error: " .. tostring(err)) end
+            end
+        end
+    end)
+
+
+    CombatTab:Section({ Title = "Auto Special Attack" })
+
+    local AutoSpecial = { on = false, busy = false, distance = 10, retryInterval = 0.1, chargeDuration = 5.5, lastAttack = 0 }
+
+    local function pickSpecialAttackTarget()
+        local myRoot = getRoot()
+        if not myRoot then return nil end
+        local bestHumanoid, bestDistance
+
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if pl ~= LocalPlayer then
+                local char = pl.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+                if root and humanoid and humanoid.Health > 0 then
+                    local distance = (root.Position - myRoot.Position).Magnitude
+                    if distance <= AutoSpecial.distance
+                        and (not bestDistance or distance < bestDistance) then
+                        bestHumanoid, bestDistance = humanoid, distance
+                    end
+                end
+            end
+        end
+
+        return bestHumanoid
+    end
+
+    local function tapSpecialKey()
+        local ok = pcall(function()
+            local virtualInput = game:GetService("VirtualInputManager")
+            virtualInput:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+            task.wait(0.05)
+            virtualInput:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+        end)
+        return ok
+    end
+
+    local function hasVisibleChargeMeter()
+        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if not playerGui then return false end
+        for _, item in ipairs(playerGui:GetDescendants()) do
+            if (item:IsA("TextLabel") or item:IsA("TextButton")) and string.find(string.upper(item.Text), "CHARGE POWER", 1, true)
+                and item.Visible then
+                local enabled = true
+                local parent = item.Parent
+                while parent and parent ~= playerGui do
+                    if parent:IsA("GuiObject") and not parent.Visible then enabled = false end
+                    if parent:IsA("ScreenGui") and not parent.Enabled then enabled = false end
+                    parent = parent.Parent
+                end
+                if enabled then return true end
+            end
+        end
+        return false
+    end
+
+    local function hasActiveAttackAnimation(character, oldTracks)
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+        if not animator then return false end
+        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+            if track.IsPlaying and not oldTracks[track] and track.Priority.Value >= Enum.AnimationPriority.Action.Value then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function autoSpecialAttackStep()
+        if AutoSpecial.busy or tick() - AutoSpecial.lastAttack < AutoSpecial.retryInterval then return end
+        local targetHumanoid = pickSpecialAttackTarget()
+        local targetCharacter = targetHumanoid and targetHumanoid.Parent
+        local character = LocalPlayer.Character
+        local animalName = character and character:GetAttribute("AnimalName")
+        if not targetHumanoid or not targetCharacter or not animalName
+            or character:GetAttribute("BasicAttacksDisabled") == true
+            or targetCharacter:GetAttribute("JumpsDisabled") == true then return end
+
+        AutoSpecial.busy = true
+        AutoSpecial.lastAttack = tick()
+        task.spawn(function()
+            local oldTracks = {}
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+            if animator then
+                for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                    oldTracks[track] = true
+                end
+            end
+
+            -- F lets the game choose and run the equipped animal's own special attack.
+            tapSpecialKey()
+            task.wait(0.25)
+
+            local sameAnimal = function()
+                return LocalPlayer.Character == character
+                    and character:GetAttribute("AnimalName") == animalName
+            end
+
+            if sameAnimal() and character:GetAttribute("BasicAttacksDisabled") == true
+                and hasVisibleChargeMeter() then
+                -- Keep the game's charge animation alive, then release after its observed charge interval.
+                task.wait(AutoSpecial.chargeDuration)
+                if sameAnimal() then tapSpecialKey() end
+            else
+                -- A victim's JumpsDisabled flag marks an active latch; never tap F again during it.
+                -- Wait for any active attack lock or game animation to finish, then retry immediately.
+                while sameAnimal() do
+                    local attackLocked = character:GetAttribute("BasicAttacksDisabled") == true
+                    local targetLatched = targetCharacter.Parent ~= nil
+                        and targetCharacter:GetAttribute("JumpsDisabled") == true
+                    local animationPlaying = hasActiveAttackAnimation(character, oldTracks)
+                    if not attackLocked and not targetLatched and not animationPlaying then break end
+                    task.wait(0.05)
+                end
+            end
+
+            AutoSpecial.lastAttack = tick()
+            AutoSpecial.busy = false
+        end)
+    end
+
+    task.spawn(function()
+        while alive do
+            task.wait(0.1)
+            if AutoSpecial.on then
+                local ok, err = pcall(autoSpecialAttackStep)
+                if not ok then warn("[AnimalFarm] auto special attack error: " .. tostring(err)) end
+            end
+        end
+    end)
+
+    CombatTab:Toggle({
+        Title = "Auto Special Attack",
+        Value = false,
+        Flag = "AutoSpecialAttackOn",
+        Callback = function(v) AutoSpecial.on = v end,
+    })
+
+    CombatTab:Slider({
+        Title = "Distance",
+        Step = 1,
+        Value = { Min = 1, Max = 20, Default = AutoSpecial.distance },
+        Flag = "AutoSpecialDistance",
+        Callback = function(v) AutoSpecial.distance = math.clamp(v, 1, 20) end,
+    })
+
+    CombatTab:Section({ Title = "Kill Aura" })
+
+    local AuraToggle
+    AuraToggle = CombatTab:Toggle({
+        Title = "Kill Aura",
+        Value = false,
+        Flag = "KillAuraOn",
+        Callback = function(v)
+            if not v then
+                Aura.on = false
+                return
+            end
+            task.spawn(function()
+                if not getAttackRemote() then
+                    notify("Kill aura", "Couldn't find the game's attack remote.")
+                    pcall(function() AuraToggle:Set(false) end)
+                    return
+                end
+                Aura.on = true
+            end)
+        end,
+    })
+
+    CombatTab:Slider({
+        Title = "Kill Aura Delay",
+        Step = 0.1,
+        Value = { Min = 0.1, Max = 2.5, Default = Aura.delay },
+        Flag = "AuraDelay",
+        Callback = function(v) Aura.delay = math.clamp(v, 0.1, 2.5) end,
+    })
+
+    local PriorityDD
+    PriorityDD = CombatTab:Dropdown({
+        Title = "Kill Aura Priority",
+        Values = PRIORITY_KEYS,
+        Value = Priority,
+        Multi = true,
+        SearchBarEnabled = false,
+        Callback = function(opt)
+            if type(opt) ~= "table" then return end
+            local selSet = {}
+            for _, v in pairs(opt) do
+                local n = type(v) == "table" and (v.Title or v.Name) or v
+                if type(n) == "string" then selSet[n] = true end
+            end
+            local order = {}
+            for _, k in ipairs(Priority) do
+                if selSet[k] then order[#order + 1] = k end
+            end
+            for _, k in ipairs(PRIORITY_KEYS) do
+                if selSet[k] and not table.find(order, k) then order[#order + 1] = k end
+            end
+            if #order > 2 then
+                order = { order[#order - 1], order[#order] } -- keep only the two most recently picked
+            end
+            Priority = order
+            pcall(function() PriorityDD:Select(Priority) end)
+        end,
+    })
+
+    AuraSafe, refreshAuraList = newWhitelist("Kill Aura Safe Whitelist", function(name)
+        if HitSafe and not HitSafe[name] then
+            HitSafe[name] = true
+            if refreshHitList then refreshHitList() end
+        end
+    end)
+
+    -- ---- kill aura keybind: press a key to record it, no manual typing ----
+    local AuraKey, capturingAuraKey
+    local AuraKeyLabel = CombatTab:Paragraph({ Title = "Kill Aura key: none" })
+
+    local function setAuraKey(name)
+        local ok, kc = pcall(function() return Enum.KeyCode[name] end)
+        if not (ok and kc and kc ~= Enum.KeyCode.Unknown) then return false end
+        AuraKey = kc
+        Values.KillAuraKey = kc.Name
+        setLabel(AuraKeyLabel, "Kill Aura key: " .. kc.Name)
+        return true
+    end
+    applyConfigAuraKey = function(name) return setAuraKey(name) end
+
+
+
+    CombatTab:Button({
+        Title = "Set Kill Aura Key (then press a key)",
+        Callback = function()
+            capturingAuraKey = true
+            notify("Press a key", "Press the key that turns Kill Aura on/off (Esc cancels)")
+        end,
+    })
+
+    local auraKeyConn = UIS.InputBegan:Connect(function(input, gp)
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        if capturingAuraKey then
+            capturingAuraKey = false
+            if input.KeyCode == Enum.KeyCode.Escape then
+                notify("Cancelled", "Kill Aura key unchanged")
+            elseif setAuraKey(input.KeyCode.Name) then
+                notify("Kill Aura key", input.KeyCode.Name)
+            end
+            return
+        end
+        if gp then return end -- typing in a text box etc.
+        if AuraKey and input.KeyCode == AuraKey then
+            pcall(function() AuraToggle:Set(not Aura.on) end)
+        end
+    end)
+
+    local plConns = {
+        Players.PlayerAdded:Connect(function()
+            task.defer(refreshHitList)
+            task.defer(refreshAuraList)
+        end),
+        Players.PlayerRemoving:Connect(function()
+            task.delay(0.3, refreshHitList)
+            task.delay(0.3, refreshAuraList)
+        end),
+    }
+
+    -- ---------- auto escape latch ----------
+    local Latch = { on = false, delay = 0.1 }
+    local LatchedRemote
+
+    local function getLatchRemote()
+        if LatchedRemote then return LatchedRemote end
+        local ok, remote = pcall(function() return RS:WaitForChild("LatchedPlayersNotifyRemoteEvent", 5) end)
+        if ok then LatchedRemote = remote end
+        return LatchedRemote
+    end
+
+    -- confirmed from a live capture: your character's own "JumpsDisabled" attribute turns true the
+    -- instant another animal latches onto you, and clears back to nil the instant you're free
+    local function isLatched()
+        local char = LocalPlayer.Character
+        if not char then return false end
+        return char:GetAttribute("JumpsDisabled") == true
+    end
+
+    -- fires on the rising edge (free -> latched), not on a repeating interval, so it never spams while
+    -- held. Below ~0.5s the escape call appears to land before the game has finished registering the
+    -- latch server-side and gets ignored, so the first attempt always waits at least that long regardless
+    -- of the slider. A couple of spaced retries cover a dropped call from lag, capped so it still can't spam.
+    local MIN_FIRE_DELAY = 0.5
+    local MAX_ATTEMPTS = 3
+    local RETRY_GAP = 0.6
+
+    task.spawn(function()
+        local wasLatched = false
+        while alive do
+            task.wait(0.05)
+            local latched = Latch.on and isLatched()
+            if latched and not wasLatched then
+                task.spawn(function()
+                    task.wait(math.max(Latch.delay, MIN_FIRE_DELAY))
+                    local attempts = 0
+                    while Latch.on and isLatched() and attempts < MAX_ATTEMPTS do
+                        attempts += 1
+                        local ok, err = pcall(function()
+                            local remote = getLatchRemote()
+                            if remote then remote:FireServer() end
+                        end)
+                        if not ok then warn("[AnimalFarm] auto escape latch error: " .. tostring(err)) end
+                        if attempts < MAX_ATTEMPTS and Latch.on and isLatched() then
+                            task.wait(RETRY_GAP)
+                        end
+                    end
+                end)
+            end
+            wasLatched = latched
+        end
+    end)
+
+
+    CombatTab:Section({ Title = "Auto Escape Latch" })
+
+    CombatTab:Toggle({
+        Title = "Auto Escape Latch",
+        Value = false,
+        Flag = "AutoEscapeLatchOn",
+        Callback = function(v) Latch.on = v end,
+    })
+
+    CombatTab:Slider({
+        Title = "Latch Escape Delay",
+        Step = 0.05,
+        Value = { Min = 0, Max = 1, Default = Latch.delay },
+        Flag = "LatchEscapeDelay",
+        Callback = function(v) Latch.delay = math.clamp(v, 0, 1) end,
+    })
+
+    HitboxCleanup = function()
+        Hit.on = false
+        Aura.on = false
+        AutoSpecial.on = false
+        Latch.on = false
+        InfStam.on = false
+        InfOxy.on = false
+        if combatVitalsConn then combatVitalsConn:Disconnect() end
+        removeOverrides()
+        if auraKeyConn then auraKeyConn:Disconnect() end
+        for _, c in ipairs(plConns) do pcall(function() c:Disconnect() end) end
+    end
+end
+
+-- ================= TAB: VISUALS (ESP) =================
+local VisualsCleanup
+do
+    local VisualsTab = Window:Tab({ Title = "Visuals", Icon = "eye" })
+    hook(VisualsTab)
+
+    local HAS_DRAWING = type(Drawing) == "table" and type(Drawing.new) == "function"
+
+    local ESP = {
+        on = false,
+        box = false,
+        glow = false,
+        glowOpacity = 50,
+        tracers = false,
+        name = false,
+        health = false,
+        distance = false,
+        info = false,
+        boxThickness = 1.5,
+        tracerThickness = 1.5,
+        textSize = 14,
+        maxDistance = 2500,
+        tracerPosition = "Bottom",
+    }
+
+    local Camera = workspace.CurrentCamera
+    local camConn = workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+        Camera = workspace.CurrentCamera
+    end)
+
+    -- ---------- Drawing objects, one set per player, reused every frame ----------
+    local Objects = {} -- [player] = { box, name, dist, info, healthBg, healthFg, tracer }
+
+    local function newText()
+        local t = Drawing.new("Text")
+        t.Center = true
+        t.Outline = true
+        t.Font = 2
+        t.Visible = false
+        return t
+    end
+
+    local function newLine()
+        local l = Drawing.new("Line")
+        l.Visible = false
+        return l
+    end
+
+    local function newSquare()
+        local sq = Drawing.new("Square")
+        sq.Filled = false
+        sq.Visible = false
+        return sq
+    end
+
+    local function createObjects()
+        local hpText = newText()
+        hpText.Center = false -- left-align horizontally beside the health bar
+        return {
+            box = newSquare(),
+            name = newText(),
+            dist = newText(),
+            info = newText(),
+            healthBg = newLine(),
+            healthFg = newLine(),
+            healthText = hpText,
+            tracer = newLine(),
+            glow = nil,
+        }
+    end
+
+    local function hideAll(o)
+        for _, d in pairs(o) do
+            if d == o.glow then d.Enabled = false else d.Visible = false end
+        end
+    end
+
+    local function destroyObjects(o)
+        for _, d in pairs(o) do
+            pcall(function() if d == o.glow then d:Destroy() else d:Remove() end end)
+        end
+    end
+
+    local function ensure(pl)
+        local o = Objects[pl]
+        if not o then
+            o = createObjects()
+            Objects[pl] = o
+        end
+        return o
+    end
+
+    local function cleanupPlayer(pl)
+        local o = Objects[pl]
+        if o then
+            destroyObjects(o)
+            Objects[pl] = nil
+        end
+    end
+
+    local removingConn = Players.PlayerRemoving:Connect(cleanupPlayer)
+
+    -- Object ESP uses matching instance names and shares the main ESP toggle/distance filter.
+    local ObjectESP = { carcass = false, targets = {}, highlights = {}, labels = {}, nextScan = 0 }
+
+    local function objectKind(inst)
+        if not inst:IsA("Model") then return nil end
+
+        local storage = workspace:FindFirstChild("CarcassesStorageModel")
+        if storage and inst == storage then return nil end
+        -- Models stored directly here are corpse roots. Avoid treating every nested model
+        -- in the storage container as a separate corpse.
+        if storage and inst.Parent == storage then return "carcass" end
+        if inst:GetAttribute("CarcassCreatedTime") ~= nil then return "carcass" end
+
+        local humanoid = inst:FindFirstChildOfClass("Humanoid")
+        if humanoid and humanoid:GetAttribute("IsDead") == true then return "carcass" end
+
+        local name = inst.Name:lower()
+        if name:find("carcass", 1, true) or name:find("corpse", 1, true) then
+            return "carcass"
+        end
+        return nil
+    end
+
+    local function hasMatchingAncestor(inst, kind)
+        local storage = workspace:FindFirstChild("CarcassesStorageModel")
+        local ancestor = inst.Parent
+        while ancestor and ancestor ~= workspace do
+            if ancestor ~= storage and objectKind(ancestor) == kind then return true end
+            ancestor = ancestor.Parent
+        end
+        return false
+    end
+
+    local function objectPosition(inst)
+        if inst:IsA("BasePart") then return inst.Position end
+        local ok, cf = pcall(function() return inst:GetBoundingBox() end)
+        return ok and cf.Position or nil
+    end
+
+    local function updateObjectESP()
+        if not ESP.on or not ObjectESP.carcass then
+            for _, highlight in pairs(ObjectESP.highlights) do highlight.Enabled = false end
+            for _, label in pairs(ObjectESP.labels) do label.Enabled = false end
+            return
+        end
+
+        if tick() >= ObjectESP.nextScan then
+            ObjectESP.nextScan = tick() + 2
+            local found = {}
+            for _, inst in ipairs(workspace:GetDescendants()) do
+                local kind = objectKind(inst)
+                if kind == "carcass" and ObjectESP.carcass and not hasMatchingAncestor(inst, kind) then
+                    found[inst] = kind
+                end
+            end
+            ObjectESP.targets = found
+
+            for inst, highlight in pairs(ObjectESP.highlights) do
+                if not found[inst] or not inst:IsDescendantOf(workspace) then
+                    pcall(function() highlight:Destroy() end)
+                    ObjectESP.highlights[inst] = nil
+                    local label = ObjectESP.labels[inst]
+                    if label then pcall(function() label:Destroy() end) end
+                    ObjectESP.labels[inst] = nil
+                end
+            end
+            for inst, kind in pairs(found) do
+                local color = kind == "carcass" and Color3.fromRGB(255, 45, 45) or Color3.new(1, 1, 1)
+                if not ObjectESP.highlights[inst] then
+                    local highlight = Instance.new("Highlight")
+                    highlight.Name = "AnimalFarmObjectESP"
+                    highlight.FillColor = color
+                    highlight.OutlineColor = color
+                    highlight.FillTransparency = 0.65
+                    highlight.OutlineTransparency = 0
+                    highlight.Adornee = inst
+                    highlight.Parent = inst
+                    ObjectESP.highlights[inst] = highlight
+                end
+
+                -- Retry label creation on every scan in case the carcass model's parts load later.
+                if kind == "carcass" and not ObjectESP.labels[inst] then
+                    local adornee = inst:IsA("BasePart") and inst or inst:FindFirstChildWhichIsA("BasePart", true)
+                    if adornee then
+                        local billboard = Instance.new("BillboardGui")
+                        billboard.Name = "AnimalFarmCarcassLabel"
+                        billboard.Adornee = adornee
+                        billboard.AlwaysOnTop = true
+                        billboard.Size = UDim2.fromOffset(110, 24)
+                        billboard.StudsOffset = Vector3.new(0, 2, 0)
+                        billboard.Parent = LocalPlayer:FindFirstChildOfClass("PlayerGui") or inst
+
+                        local text = Instance.new("TextLabel")
+                        text.BackgroundTransparency = 1
+                        text.Size = UDim2.fromScale(1, 1)
+                        text.Font = Enum.Font.GothamBold
+                        text.Text = "Carcass"
+                        text.TextColor3 = color
+                        text.TextSize = 14
+                        text.TextStrokeTransparency = 0.25
+                        text.Parent = billboard
+                        ObjectESP.labels[inst] = billboard
+                    end
+                end
+            end
+        end
+
+        local cameraPosition = Camera.CFrame.Position
+        for inst, highlight in pairs(ObjectESP.highlights) do
+            local pos = objectPosition(inst)
+            local inRange = pos and (ESP.maxDistance <= 0 or (pos - cameraPosition).Magnitude <= ESP.maxDistance)
+            local visible = inRange and ObjectESP[ObjectESP.targets[inst]] == true or false
+            highlight.Enabled = visible
+            local label = ObjectESP.labels[inst]
+            if label then label.Enabled = visible and ObjectESP.targets[inst] == "carcass" end
+        end
+    end
+
+    local function clearObjectESP()
+        for _, highlight in pairs(ObjectESP.highlights) do
+            pcall(function() highlight:Destroy() end)
+        end
+        for _, label in pairs(ObjectESP.labels) do
+            pcall(function() label:Destroy() end)
+        end
+        ObjectESP.highlights = {}
+        ObjectESP.labels = {}
+        ObjectESP.targets = {}
+    end
+
+    -- ---------- per-player update: Model:GetBoundingBox() handles any animal's rig, no part names needed ----------
+    local function updateFor(pl, o)
+        local char = pl.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if not (ESP.on and char and hum and root and hum.Health > 0) then
+            hideAll(o)
+            return
+        end
+
+        local distanceFromCamera = (Camera.CFrame.Position - root.Position).Magnitude
+        if ESP.maxDistance > 0 and distanceFromCamera > ESP.maxDistance then
+            hideAll(o)
+            return
+        end
+
+        if ESP.glow then
+            if not o.glow or o.glow.Adornee ~= char then
+                if o.glow then o.glow:Destroy() end
+                o.glow = Instance.new("Highlight")
+                o.glow.Name = "AnimalFarmESPGlow"
+                o.glow.Parent = char
+            end
+            o.glow.Adornee = char
+            o.glow.FillColor = Color3.new(1, 1, 1)
+            o.glow.OutlineColor = Color3.new(1, 1, 1)
+            local transparency = 1 - math.clamp(ESP.glowOpacity / 100, 0, 1)
+            o.glow.FillTransparency = transparency
+            o.glow.OutlineTransparency = transparency
+            o.glow.Enabled = true
+        elseif o.glow then
+            o.glow.Enabled = false
+        end
+
+        local ok, cf, size = pcall(function() return char:GetBoundingBox() end)
+        if not ok then
+            hideAll(o)
+            return
+        end
+
+        local topWorld = cf.Position + Vector3.new(0, size.Y / 2, 0)
+        local bottomWorld = cf.Position - Vector3.new(0, size.Y / 2, 0)
+        local topScreen, onTop = Camera:WorldToViewportPoint(topWorld)
+        local bottomScreen, onBottom = Camera:WorldToViewportPoint(bottomWorld)
+        if topScreen.Z <= 0 or not (onTop or onBottom) then
+            hideAll(o)
+            return
+        end
+
+        local height = math.abs(topScreen.Y - bottomScreen.Y)
+        if height < 2 then
+            hideAll(o)
+            return
+        end
+        local width = height * 0.62
+        local cx = (topScreen.X + bottomScreen.X) / 2
+        local boxTop = math.min(topScreen.Y, bottomScreen.Y)
+        local boxBottom = boxTop + height
+
+        if ESP.box then
+            o.box.Visible = true
+            o.box.Thickness = ESP.boxThickness
+            o.box.Color = Color3.fromRGB(255, 255, 255)
+            o.box.Size = Vector2.new(width, height)
+            o.box.Position = Vector2.new(cx - width / 2, boxTop)
+        else
+            o.box.Visible = false
+        end
+
+        if ESP.tracers then
+            o.tracer.Visible = true
+            o.tracer.Thickness = ESP.tracerThickness
+            o.tracer.Color = Color3.fromRGB(255, 255, 255)
+            local viewport = Camera.ViewportSize
+            if ESP.tracerPosition == "Top" then
+                o.tracer.From = Vector2.new(viewport.X / 2, 0)
+            elseif ESP.tracerPosition == "Center" then
+                local localRoot = getRoot()
+                local characterScreen, onScreen
+                if localRoot then
+                    characterScreen, onScreen = Camera:WorldToViewportPoint(localRoot.Position)
+                end
+                if localRoot and characterScreen and onScreen and characterScreen.Z > 0 then
+                    o.tracer.From = Vector2.new(characterScreen.X, characterScreen.Y)
+                else
+                    o.tracer.From = Vector2.new(viewport.X / 2, viewport.Y / 2)
+                end
+            else
+                o.tracer.From = Vector2.new(viewport.X / 2, viewport.Y)
+            end
+            o.tracer.To = Vector2.new(cx, boxBottom)
+        else
+            o.tracer.Visible = false
+        end
+
+        if ESP.health then
+            local pct = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+            local barX = cx - width / 2 - 6
+            o.healthBg.Visible = true
+            o.healthBg.Thickness = 3
+            o.healthBg.Color = Color3.fromRGB(40, 40, 40)
+            o.healthBg.From = Vector2.new(barX, boxTop)
+            o.healthBg.To = Vector2.new(barX, boxBottom)
+
+            o.healthFg.Visible = true
+            o.healthFg.Thickness = 3
+            o.healthFg.Color = Color3.fromRGB(255 - math.floor(255 * pct), math.floor(255 * pct), 0)
+            o.healthFg.From = Vector2.new(barX, boxBottom)
+            o.healthFg.To = Vector2.new(barX, boxBottom - height * pct)
+
+            local hpSize = math.max(10, ESP.textSize - 2)
+            o.healthText.Visible = true
+            o.healthText.Size = hpSize
+            o.healthText.Color = Color3.fromRGB(255, 255, 255)
+            local hpText = tostring(math.floor(hum.Health))
+            local hpWidth = #hpText * hpSize * 0.6
+            o.healthText.Center = false
+            o.healthText.Position = Vector2.new(barX - hpWidth - 6, boxTop + height / 2 - hpSize / 2)
+            o.healthText.Text = hpText
+        else
+            o.healthBg.Visible = false
+            o.healthFg.Visible = false
+            o.healthText.Visible = false
+        end
+
+        local aboveY = boxTop - ESP.textSize - 2
+        if ESP.name then
+            o.name.Visible = true
+            o.name.Size = ESP.textSize
+            o.name.Color = Color3.fromRGB(255, 255, 255)
+            o.name.Position = Vector2.new(cx, aboveY)
+            o.name.Text = pl.Name
+        else
+            o.name.Visible = false
+        end
+
+        local belowY = boxBottom + 2
+        if ESP.distance then
+            local dist = distanceFromCamera
+            o.dist.Visible = true
+            o.dist.Size = ESP.textSize
+            o.dist.Color = Color3.fromRGB(255, 255, 255)
+            o.dist.Position = Vector2.new(cx, belowY)
+            o.dist.Text = string.format("[%dM]", math.floor(dist * 0.28 + 0.5))
+            belowY = belowY + ESP.textSize + 2
+        else
+            o.dist.Visible = false
+        end
+
+        if ESP.info then
+            local parts = {}
+            local an = char:GetAttribute("AnimalName")
+            local aa = char:GetAttribute("AnimalAge")
+            local ag = char:GetAttribute("AnimalGender")
+            if an then parts[#parts + 1] = an end
+            if aa then parts[#parts + 1] = aa end
+            if ag then parts[#parts + 1] = ag end
+            local growth = char:GetAttribute("GrowthPercentage")
+            if type(growth) == "number" and growth < 0.999 then
+                local growthPercent = math.floor(math.clamp(growth, 0, 1) * 100 + 0.5)
+                parts[#parts + 1] = tostring(growthPercent) .. "%"
+            end
+            if #parts > 0 then
+                o.info.Visible = true
+                o.info.Size = ESP.textSize
+                local dietText = tostring(an or ""):lower()
+                for attributeName, attributeValue in pairs(char:GetAttributes()) do
+                    if type(attributeValue) == "string" then
+                        local key = tostring(attributeName):lower()
+                        if key:find("diet") or key:find("type") or key:find("food") or key:find("class") then
+                            dietText = dietText .. " " .. attributeValue:lower()
+                        end
+                    end
+                end
+                local infoColor = Color3.fromRGB(190, 210, 255)
+                if dietText:find("herbivore", 1, true) then
+                    infoColor = Color3.fromRGB(0, 255, 0)
+                elseif dietText:find("carnivore", 1, true) then
+                    infoColor = Color3.fromRGB(255, 0, 0)
+                elseif dietText:find("omnivore", 1, true) then
+                    infoColor = Color3.fromRGB(255, 165, 0)
+                end
+                o.info.Color = infoColor
+                o.info.Position = Vector2.new(cx, belowY)
+                o.info.Text = table.concat(parts, " | ")
+            else
+                o.info.Visible = false
+            end
+        else
+            o.info.Visible = false
+        end
+    end
+
+    local renderConn
+    local function startRender()
+        if renderConn then return end
+        renderConn = RunService.RenderStepped:Connect(function()
+            updateObjectESP()
+            for _, pl in ipairs(Players:GetPlayers()) do
+                if pl ~= LocalPlayer then
+                    local o = ensure(pl)
+                    local ok, err = pcall(updateFor, pl, o)
+                    if not ok then warn("[AnimalFarm] ESP error: " .. tostring(err)) end
+                end
+            end
+        end)
+    end
+
+    local function stopRender()
+        if renderConn then
+            renderConn:Disconnect()
+            renderConn = nil
+        end
+        for _, o in pairs(Objects) do hideAll(o) end
+        for _, highlight in pairs(ObjectESP.highlights) do highlight.Enabled = false end
+    end
+
+
+    VisualsTab:Section({ Title = "ESP" })
+
+    local ESPToggle
+    ESPToggle = VisualsTab:Toggle({
+        Title = "ESP Enabled [F1]",
+        Value = false,
+        Flag = "ESPOn",
+        Callback = function(v)
+            if v and not HAS_DRAWING then
+                notify("ESP", "Your executor doesn't support the Drawing library, ESP can't render.")
+                ESP.on = false
+                pcall(function() ESPToggle:Set(false) end)
+                return
+            end
+            ESP.on = v
+            if v then startRender() else stopRender() end
+        end,
+    })
+
+    local espKeyConn = UIS.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        if input.KeyCode == Enum.KeyCode.F1 then
+            pcall(function() ESPToggle:Set(not ESP.on) end)
+        end
+    end)
+
+    VisualsTab:Toggle({
+        Title = "Box ESP",
+        Value = false,
+        Flag = "ESPBox",
+        Callback = function(v) ESP.box = v end,
+    })
+
+    VisualsTab:Toggle({
+        Title = "Carcass ESP",
+        Value = false,
+        Flag = "ESPCarcass",
+        Callback = function(v) ObjectESP.carcass = v ObjectESP.nextScan = 0 end,
+    })
+
+    VisualsTab:Toggle({
+        Title = "Glow ESP",
+        Value = false,
+        Flag = "ESPGlow",
+        Callback = function(v) ESP.glow = v end,
+    })
+
+    VisualsTab:Slider({
+        Title = "Glow Opacity (%)",
+        Step = 1,
+        Value = { Min = 0, Max = 100, Default = ESP.glowOpacity },
+        Flag = "ESPGlowOpacity",
+        Callback = function(v) ESP.glowOpacity = v end,
+    })
+
+    VisualsTab:Toggle({
+        Title = "Tracers",
+        Value = false,
+        Flag = "ESPTracers",
+        Callback = function(v) ESP.tracers = v end,
+    })
+
+    VisualsTab:Toggle({
+        Title = "Name ESP",
+        Value = false,
+        Flag = "ESPName",
+        Callback = function(v) ESP.name = v end,
+    })
+
+    VisualsTab:Toggle({
+        Title = "Health Bar",
+        Value = false,
+        Flag = "ESPHealth",
+        Callback = function(v) ESP.health = v end,
+    })
+
+    VisualsTab:Toggle({
+        Title = "Distance",
+        Value = false,
+        Flag = "ESPDistance",
+        Callback = function(v) ESP.distance = v end,
+    })
+
+    VisualsTab:Toggle({
+        Title = "Animal Info",
+        Value = false,
+        Flag = "ESPInfo",
+        Callback = function(v) ESP.info = v end,
+    })
+
+    VisualsTab:Section({ Title = "Appearance" })
+
+    VisualsTab:Dropdown({
+        Title = "Tracers Position",
+        Values = { "Top", "Bottom", "Center" },
+        Value = ESP.tracerPosition,
+        Flag = "ESPTracerPosition",
+        Callback = function(value)
+            local selected = type(value) == "table" and (value.Title or value.Name or value[1]) or value
+            if selected == "Top" or selected == "Bottom" or selected == "Center" then
+                ESP.tracerPosition = selected
+            end
+        end,
+    })
+
+    VisualsTab:Slider({
+        Title = "ESP Distance Filter",
+        Step = 10,
+        Value = { Min = 0, Max = 2500, Default = ESP.maxDistance },
+        Flag = "ESPMaxDistance",
+        Callback = function(v) ESP.maxDistance = v end,
+    })
+
+    VisualsTab:Slider({
+        Title = "Box Thickness",
+        Step = 0.1,
+        Value = { Min = 0.5, Max = 5, Default = ESP.boxThickness },
+        Flag = "ESPBoxThickness",
+        Callback = function(v) ESP.boxThickness = v end,
+    })
+
+    VisualsTab:Slider({
+        Title = "Tracer Thickness",
+        Step = 0.1,
+        Value = { Min = 0.5, Max = 5, Default = ESP.tracerThickness },
+        Flag = "ESPTracerThickness",
+        Callback = function(v) ESP.tracerThickness = v end,
+    })
+
+    VisualsTab:Slider({
+        Title = "Text Size",
+        Step = 1,
+        Value = { Min = 8, Max = 30, Default = ESP.textSize },
+        Flag = "ESPTextSize",
+        Callback = function(v) ESP.textSize = v end,
+    })
+
+    VisualsCleanup = function()
+        ESP.on = false
+        stopRender()
+        for pl in pairs(Objects) do cleanupPlayer(pl) end
+        clearObjectESP()
+        if removingConn then removingConn:Disconnect() end
+        if espKeyConn then espKeyConn:Disconnect() end
+        if camConn then camConn:Disconnect() end
+    end
+end
+
+local MovementTab = Window:Tab({ Title = "Movement", Icon = "move" })
+hook(MovementTab)
+
+-- ================= TAB 1: FARM =================
+local Tab = Window:Tab({ Title = "Farm", Icon = "leaf" })
+hook(Tab)
+
+local WaterLabel  = Tab:Paragraph({ Title = "Water: ..." })
+local FoodLabel   = Tab:Paragraph({ Title = "Food: ..." })
+local StatusLabel = Tab:Paragraph({ Title = "Status: Idle" })
+
+local DrinkToggle, EatToggle
+
+DrinkToggle = Tab:Toggle({
+    Title = "Auto Drink",
+    Value = false,
+    Flag = "AutoDrink",
+    Callback = function(v)
+        State.Drinking = v
+        if not v then task.spawn(releaseWater) end
+        -- start right away; threshold only applies to later cycles
+        if v and not State.Busy then task.spawn(runCycle, "Water", false) end
+    end,
+})
+
+EatToggle = Tab:Toggle({
+    Title = "Auto Eat",
+    Value = false,
+    Flag = "AutoEat",
+    Callback = function(v)
+        State.Eating = v
+        if v and not State.Busy then task.spawn(runCycle, "Food", false) end
+    end,
+})
+
+Tab:Toggle({
+    Title = "Noclip While TP",
+    Value = true,
+    Flag = "NoclipMove",
+    Callback = function(v) State.NoclipMove = v refreshNoclip() end,
+})
+
+Tab:Section({ Title = "Auto Spawn" })
+
+local AutoSpawn = { on = false, busy = false, awaitingSpawn = false, character = "StarterCharacter1", lastRequest = 0, lastErrorNotice = 0 }
+
+local function getSavedCharacterNames()
+    local found = {}
+    local function add(value)
+        if type(value) == "string" then
+            value = string.gsub(value, "^%s*(.-)%s*$", "%1")
+            if value ~= "" and #value <= 80 then found[value] = true end
+        end
+    end
+
+    local function inspect(instance, allowCharacterName)
+        local okUnique, uniqueName = pcall(function() return instance:GetAttribute("UniqueCharacterName") end)
+        if okUnique then add(uniqueName) end
+        if allowCharacterName then
+            local okCharacter, characterName = pcall(function() return instance:GetAttribute("CharacterName") end)
+            if okCharacter then add(characterName) end
+        end
+        if instance:IsA("StringValue") then
+            local key = string.lower(instance.Name)
+            if string.find(key, "character", 1, true) or string.find(key, "uniquename", 1, true) then
+                add(instance.Value)
+            end
+        end
+        if instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox") then
+            local text = string.gsub(instance.Text, "^%s*(.-)%s*$", "%1")
+            local slotName = string.match(text, "(StarterCharacter%d+)")
+            if slotName then
+                add(slotName)
+            elseif allowCharacterName then
+                local key = string.lower(instance.Name)
+                if string.find(key, "uniquecharacter", 1, true)
+                    or string.find(key, "charactername", 1, true)
+                    or string.find(key, "slotname", 1, true)
+                    or string.find(key, "nametextlabel", 1, true) then
+                    add(text)
+                end
+            end
+        end
+        local objectName = string.match(instance.Name, "(StarterCharacter%d+)")
+        if objectName then add(objectName) end
+    end
+
+    -- The saved-character cards represent the whole inventory; the menu controller folder only
+    -- carries attributes for whichever card is currently highlighted.
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local savedScreen = playerGui and playerGui:FindFirstChild("SavedCharactersScreenGui")
+    local characterList = savedScreen and savedScreen:FindFirstChild("CharactersFrame", true)
+    if characterList then
+        inspect(characterList, true)
+        for _, item in ipairs(characterList:GetDescendants()) do inspect(item, true) end
+    elseif savedScreen then
+        inspect(savedScreen, true)
+        for _, item in ipairs(savedScreen:GetDescendants()) do inspect(item, true) end
+    end
+
+    -- If the list UI is not available, fall back to the selected character metadata.
+    if next(found) == nil then
+        local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
+        local shared = playerScripts and playerScripts:FindFirstChild("AnimalGameSharedCore")
+        local guiData = shared and shared:FindFirstChild("GUI")
+        local savedMenu = guiData and guiData:FindFirstChild("SavedCharactersMenu")
+        if savedMenu then
+            inspect(savedMenu, true)
+            for _, item in ipairs(savedMenu:GetDescendants()) do inspect(item, true) end
+        end
+    end
+
+    local names = {}
+    for name in pairs(found) do names[#names + 1] = name end
+    table.sort(names, function(a, b) return a:lower() < b:lower() end)
+    if #names == 0 then names = { "StarterCharacter1", "StarterCharacter2" } end
+    return names
+end
+
+local AutoSpawnNames = getSavedCharacterNames()
+if not table.find(AutoSpawnNames, AutoSpawn.character) then AutoSpawn.character = AutoSpawnNames[1] end
+local AutoSpawnDropdown
+local AutoSpawnRefreshing = false
+
+Tab:Toggle({
+    Title = "Auto Spawn",
+    Value = false,
+    Flag = "AutoSpawnOn",
+    Callback = function(v) AutoSpawn.on = v end,
+})
+
+AutoSpawnDropdown = Tab:Dropdown({
+    Title = "Character",
+    Values = AutoSpawnNames,
+    Value = AutoSpawn.character,
+    SearchBarEnabled = true,
+    Flag = "AutoSpawnCharacter",
+    Callback = function(value)
+        if AutoSpawnRefreshing then return end
+        local selected = type(value) == "table" and (value.Title or value.Name or value[1]) or value
+        if type(selected) == "string" and selected ~= "" then AutoSpawn.character = selected end
+    end,
+})
+
+local function refreshAutoSpawnCharacters()
+    local ok, names = pcall(getSavedCharacterNames)
+    if not ok or #names == #AutoSpawnNames then
+        if not ok then return end
+        local unchanged = true
+        for i, name in ipairs(names) do
+            if AutoSpawnNames[i] ~= name then unchanged = false break end
+        end
+        if unchanged then return end
+    end
+
+    AutoSpawnRefreshing = true
+    local selected = AutoSpawn.character
+    AutoSpawnNames = names
+    pcall(function() AutoSpawnDropdown:Refresh(AutoSpawnNames, true) end)
+    if not table.find(AutoSpawnNames, selected) then
+        selected = AutoSpawnNames[1]
+        AutoSpawn.character = selected
+    end
+    pcall(function() AutoSpawnDropdown:Select(selected) end)
+    AutoSpawnRefreshing = false
+end
+
+task.spawn(function()
+    while alive do
+        task.wait(0.5)
+        local ok, err = pcall(refreshAutoSpawnCharacters)
+        if not ok then warn("[AnimalFarm] character list refresh error: " .. tostring(err)) end
+    end
+end)
+
+local function isAutoSpawnCharacterReady()
+    local character = LocalPlayer.Character
+    if not character or not character.Parent then return false end
+    local animalName = character:GetAttribute("AnimalName")
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = character:FindFirstChild("HumanoidRootPart")
+    return type(animalName) == "string" and animalName ~= ""
+        and humanoid ~= nil and humanoid.Health > 0 and root ~= nil
+end
+
+local function autoSpawnStep()
+    if not AutoSpawn.on then return end
+    if isAutoSpawnCharacterReady() then
+        AutoSpawn.awaitingSpawn = false
+        return
+    end
+    if AutoSpawn.busy or AutoSpawn.awaitingSpawn or tick() - AutoSpawn.lastRequest < 2 then return end
+
+    AutoSpawn.busy = true
+    AutoSpawn.lastRequest = tick()
+    local requestedName = AutoSpawn.character
+    task.spawn(function()
+        local remote = RS:FindFirstChild("SpawnAsCharacterRemoteFunction")
+            or RS:WaitForChild("SpawnAsCharacterRemoteFunction", 5)
+        if not (remote and remote:IsA("RemoteFunction")) then
+            AutoSpawn.busy = false
+            if tick() - AutoSpawn.lastErrorNotice > 8 then
+                AutoSpawn.lastErrorNotice = tick()
+                notify("Auto Spawn", "Could not find the character spawn remote.")
+            end
+            return
+        end
+
+        local ok, result = pcall(function()
+            return remote:InvokeServer(requestedName)
+        end)
+        if ok and result ~= false then
+            AutoSpawn.awaitingSpawn = true
+            local deadline = tick() + 8
+            while alive and AutoSpawn.on and tick() < deadline and not isAutoSpawnCharacterReady() do
+                task.wait(0.1)
+            end
+            if isAutoSpawnCharacterReady() then
+                AutoSpawn.awaitingSpawn = false
+            else
+                AutoSpawn.awaitingSpawn = false
+                if tick() - AutoSpawn.lastErrorNotice > 8 then
+                    AutoSpawn.lastErrorNotice = tick()
+                    notify("Auto Spawn", "Spawn has not completed yet; Auto Spawn will retry.")
+                end
+            end
+        elseif tick() - AutoSpawn.lastErrorNotice > 8 then
+            AutoSpawn.lastErrorNotice = tick()
+            notify("Auto Spawn", ok and "The game rejected the selected character." or ("Spawn request failed: " .. tostring(result)))
+        end
+        AutoSpawn.busy = false
+    end)
+end
+
+task.spawn(function()
+    while alive do
+        task.wait(0.25)
+        local ok, err = pcall(autoSpawnStep)
+        if not ok then warn("[AnimalFarm] auto spawn error: " .. tostring(err)) end
+    end
+end)
+
+
+task.spawn(function()
+    while alive and task.wait(0.4) do
+        pcall(function()
+            local w, f = readStat("Water"), readStat("Food")
+            setLabel(WaterLabel, "Water: " .. (w and string.format("%.1f%%", w) or "can't read"))
+            setLabel(FoodLabel, "Food: " .. (f and string.format("%.1f%%", f) or "can't read"))
+            setLabel(StatusLabel, "Status: " .. Status)
+        end)
+    end
+end)
+
+-- ================= TAB 4: CONFIG =================
+local ConfigTab = Window:Tab({ Title = "Config", Icon = "user" })
+hook(ConfigTab)
+
+local ConfigNameInput
+ConfigNameInput = ConfigTab:Input({
+    Title = "Config Name",
+    Value = "",
+    Callback = function(text) ConfigName = sanitizeName(text) or "" end,
+})
+
+local function refreshConfigDropdown()
+    local list = listConfigs()
+    if ConfigDropdown then
+        pcall(function() ConfigDropdown:Refresh(list, true) end)
+        if SelectedAutoConfig ~= "" then pcall(function() ConfigDropdown:Select(SelectedAutoConfig) end) end
+    end
+end
+
+ConfigDropdown = ConfigTab:Dropdown({
+    Title = "Load Config",
+    Values = listConfigs(),
+    Value = SelectedAutoConfig,
+    SearchBarEnabled = true,
+    Callback = function(opt)
+        local name = type(opt) == "table" and (opt.Title or opt[1]) or opt
+        if type(name) == "string" then SelectedAutoConfig = name; saveConfigPrefs() end
+    end,
+})
+
+ConfigTab:Button({
+    Title = "Create Config",
+    Callback = function()
+        local name = sanitizeName(ConfigName)
+        if not name then notify("Config name required", "Enter a config name first"); return end
+        if not FS_OK then notify("No file access", "Config creation is unavailable"); return end
+        if isfile(configPath(name)) then notify("Config exists", "Choose another name"); return end
+        ensureDir()
+        local ok = pcall(writefile, configPath(name), HttpService:JSONEncode({ version = 4, values = {} }))
+        if not ok then notify("Create failed", name); return end
+        SelectedAutoConfig = name
+        refreshConfigDropdown()
+        pcall(function() ConfigDropdown:Select(name) end)
+        pcall(function() ConfigNameInput:Set(name) end)
+        notify("Config created", name)
+    end,
+})
+
+ConfigTab:Button({
+    Title = "Save Config",
+    Callback = function()
+        local name = sanitizeName(ConfigName) or sanitizeName(SelectedAutoConfig)
+        if not name or not isfile(configPath(name)) then notify("Create config first", "Create the config before saving it"); return end
+        if saveConfig(name, false) then refreshConfigDropdown(); pcall(function() ConfigDropdown:Select(name) end) end
+    end,
+})
+
+ConfigTab:Button({
+    Title = "Overwrite Config",
+    Callback = function()
+        if saveConfig(SelectedAutoConfig, false) then refreshConfigDropdown(); pcall(function() ConfigDropdown:Select(SelectedAutoConfig) end) end
+    end,
+})
+
+ConfigTab:Button({
+    Title = "Load Config",
+    Callback = function() if loadConfig(SelectedAutoConfig, false) then refreshConfigDropdown() end end,
+})
+
+local AutoLoadLabel
+local function updateAutoLoadLabel()
+    setLabel(AutoLoadLabel, "Auto Load Config: " .. (AutoConfigName ~= "" and AutoConfigName or "None"))
+end
+
+ConfigTab:Button({
+    Title = "Auto Load",
+    Callback = function()
+        local target = (LoadedConfigName ~= "" and LoadedConfigName) or SelectedAutoConfig
+        if target == "" or not isfile(configPath(target)) then notify("No config selected", "Select or load a config first"); return end
+        local previous = AutoConfigName
+        if not writeAutoLoadMarker(target, true) then notify("Auto Load not saved", "Could not update the config file"); return end
+        if previous ~= "" and previous ~= target then writeAutoLoadMarker(previous, false) end
+        AutoConfigName = target
+        local prefsSaved = saveConfigPrefs()
+        SelectedAutoConfig = target
+        refreshConfigDropdown(); updateAutoLoadLabel()
+        if prefsSaved then
+            notify("Auto Load set", AutoConfigName)
+        else
+            notify("Auto Load set", AutoConfigName .. " (saved in config)")
+        end
+    end,
+})
+
+ConfigTab:Button({
+    Title = "Delete Config",
+    Callback = function()
+        local name = sanitizeName(SelectedAutoConfig)
+        if FS_OK and name and isfile(configPath(name)) and type(delfile) == "function" then
+            local ok = pcall(delfile, configPath(name))
+            if ok then
+                if SelectedAutoConfig == name then SelectedAutoConfig = "" end
+                if LoadedConfigName == name then LoadedConfigName = "" end
+                if AutoConfigName == name then AutoConfigName = "" end
+                saveConfigPrefs(); refreshConfigDropdown(); updateAutoLoadLabel(); notify("Config deleted", name)
+            end
+        else
+            notify("Config not found", "Select a config first")
+        end
+    end,
+})
+
+AutoLoadLabel = ConfigTab:Paragraph({ Title = "Auto Load Config: None" })
+updateAutoLoadLabel()
+
+local SettingsTab = Window:Tab({ Title = "Settings", Icon = "settings" })
+hook(SettingsTab)
+
+-- ================= TAB 3: MENU (minimize key) =================
+local MenuTab = Window:Tab({ Title = "Menu", Icon = "menu" })
+hook(MenuTab)
+
+-- open / close the window using the minimize key
+local WindowOpen = true
+local function toggleWindow()
+    local ok = pcall(function() Window:Toggle() end)
+    if not ok then
+        if WindowOpen then
+            pcall(function() Window:Close() end)
+        else
+            pcall(function() Window:Open() end)
+        end
+    end
+    WindowOpen = not WindowOpen
+end
+
+-- ---- minimize key (default Right Alt) ----
+local MinKey = Enum.KeyCode.RightAlt
+local capturingKey = false
+local MinKeyLabel
+
+local function setMinKey(name)
+    local ok, kc = pcall(function() return Enum.KeyCode[name] end)
+    if not (ok and kc and kc ~= Enum.KeyCode.Unknown) then return false end
+    MinKey = kc
+    Values.MinKey = kc.Name
+    setLabel(MinKeyLabel, "Minimize key: " .. kc.Name)
+    return true
+end
+applyConfigMinKey = function(name) return setMinKey(name) end
+
+MinKeyLabel = MenuTab:Paragraph({ Title = "Minimize key: RightAlt" })
+
+MenuTab:Button({
+    Title = "Change Minimize Key (then press a key)",
+    Callback = function()
+        capturingKey = true
+        notify("Press a key", "Press the new minimize key (Esc cancels)")
+    end,
+})
+
+
+
+local keyConn = UIS.InputBegan:Connect(function(input, gp)
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    if capturingKey then
+        capturingKey = false
+        if input.KeyCode == Enum.KeyCode.Escape then
+            notify("Cancelled", "Minimize key unchanged")
+        elseif setMinKey(input.KeyCode.Name) then
+            notify("Minimize key", input.KeyCode.Name)
+        end
+        return
+    end
+    if gp then return end -- typing in a text box etc.
+    if input.KeyCode == MinKey then toggleWindow() end
+end)
+
+-- ================= TAB 2: SETTINGS =================
+SettingsTab:Section({ Title = "Refill" })
+
+SettingsTab:Slider({
+    Title = "Refill When Below (%)",
+    Step = 1,
+    Value = { Min = 56, Max = 100, Default = Config.RefillStart },
+    Flag = "RefillStart",
+    Callback = function(v) Config.RefillStart = v end,
+})
+
+SettingsTab:Slider({
+    Title = "Refill Until (%)",
+    Step = 1,
+    Value = { Min = 60, Max = 100, Default = Config.RefillTarget },
+    Flag = "RefillTarget",
+    Callback = function(v) Config.RefillTarget = v end,
+})
+
+SettingsTab:Slider({
+    Title = "Remote Interval (sec)",
+    Step = 0.1,
+    Value = { Min = 0.2, Max = 1.5, Default = Config.FireInterval },
+    Flag = "FireInterval",
+    Callback = function(v) Config.FireInterval = v end,
+})
+
+SettingsTab:Slider({
+    Title = "Switch Source If No Progress (sec)",
+    Step = 1,
+    Value = { Min = 2, Max = 10, Default = Config.StallTime },
+    Flag = "StallTime",
+    Callback = function(v) Config.StallTime = v end,
+})
+
+SettingsTab:Toggle({
+    Title = "Verify 'Click E' prompt before refilling (recommended)",
+    Value = true,
+    Flag = "VerifyPrompt",
+    Callback = function(v) Config.VerifyPrompt = v end,
+})
+
+SettingsTab:Slider({
+    Title = "Wait For Prompt After Arriving (sec)",
+    Step = 0.5,
+    Value = { Min = 0.5, Max = 4, Default = Config.PromptWait },
+    Flag = "PromptWait",
+    Callback = function(v) Config.PromptWait = v end,
+})
+
+SettingsTab:Section({ Title = "Water" })
+
+SettingsTab:Toggle({
+    Title = "Drink At The Shoreline (terrain water, never underground; off = old water-part method)",
+    Value = true,
+    Flag = "ShoreDrink",
+    Callback = function(v) Config.WaterMode = v and "Shoreline" or "Parts" end,
+})
+
+SettingsTab:Toggle({
+    Title = "Face The Water While Drinking (the game cancels drinking if you look away)",
+    Value = true,
+    Flag = "FaceWater",
+    Callback = function(v) Config.FaceWater = v end,
+})
+
+SettingsTab:Toggle({
+    Title = "Also Tilt Down Toward The Water Surface (off = only turn left/right)",
+    Value = false,
+    Flag = "TiltToWater",
+    Callback = function(v) Config.TiltToWater = v end,
+})
+
+SettingsTab:Slider({
+    Title = "Flat-Water Maps: Studs To Stand Past The Waterline (negative = on land)",
+    Step = 0.5,
+    Value = { Min = -3, Max = 4, Default = Config.PlaneShoreOffset },
+    Flag = "PlaneShoreOffset",
+    Callback = function(v) Config.PlaneShoreOffset = v end,
+})
+
+SettingsTab:Slider({
+    Title = "How Far Across The Map Auto Drink Looks For Water (studs)",
+    Step = 100,
+    Value = { Min = 200, Max = 4000, Default = Config.WaterSearchDistance },
+    Flag = "WaterSearchDistance",
+    Callback = function(v) Config.WaterSearchDistance = v end,
+})
+
+SettingsTab:Button({
+    Title = "Unstick: Go To Nearest Shore (use if you're stuck in water / under the map)",
+    Callback = function() task.spawn(rescueToShore) end,
+})
+
+SettingsTab:Toggle({
+    Title = "Prefer Main Water Part (falls back to other water if it fails)",
+    Value = Config.MainWaterOnly,
+    Flag = "MainWaterOnly",
+    Callback = function(v)
+        Config.MainWaterOnly = v
+        Cache.Water.t = 0
+    end,
+})
+
+local WaterNameBox = SettingsTab:Input({
+    Title = "Main Water Part Name (exact name, blank = auto: lowest big water part)",
+    Value = Config.WaterName,
+    Placeholder = "e.g. MainWaterPart",
+    Flag = "WaterName",
+    Callback = function(text)
+        Config.WaterName = tostring(text or ""):match("^%s*(.-)%s*$")
+        Cache.Water.t = 0
+    end,
+})
+
+SettingsTab:Button({
+    Title = "Set Main Water Part From Here (stand where you can drink)",
+    Callback = function()
+        local root = getRoot()
+        if not root then return end
+        local params = OverlapParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { LocalPlayer.Character }
+        local best, bestScore
+        for _, p in ipairs(workspace:GetPartBoundsInRadius(root.Position, 12, params)) do
+            if not p:IsA("Terrain") then
+                local score = p.Size.X * p.Size.Z
+                if p.Material == Enum.Material.Water then score = score * 1000 end
+                if not bestScore or score > bestScore then best, bestScore = p, score end
+            end
+        end
+        if not best then
+            notify("Not found", "No part near you. Stand right at the water, then try again.")
+            return
+        end
+        Config.WaterName = best.Name
+        pcall(function() WaterNameBox:Set(best.Name) end)
+        Cache.Water.t = 0
+        notify("Main water set", best.Name)
+    end,
+})
+
+local Fly = { on = false, speed = 8, forceRoot = nil, attachment = nil, hoverForce = nil }
+local flyConn
+
+local function clearFlyHover()
+    if Fly.hoverForce then pcall(function() Fly.hoverForce:Destroy() end) end
+    if Fly.attachment then pcall(function() Fly.attachment:Destroy() end) end
+    Fly.forceRoot, Fly.attachment, Fly.hoverForce = nil, nil, nil
+end
+
+local function keepFlyHover(root)
+    if Fly.forceRoot ~= root or not Fly.hoverForce or not Fly.attachment then
+        clearFlyHover()
+        local attachment = Instance.new("Attachment")
+        attachment.Name = "AnimalFarmFlyAttachment"
+        attachment.Parent = root
+
+        local force = Instance.new("VectorForce")
+        force.Name = "AnimalFarmFlyHoverForce"
+        force.Attachment0 = attachment
+        force.RelativeTo = Enum.ActuatorRelativeTo.World
+        force.ApplyAtCenterOfMass = true
+        force.Parent = root
+
+        Fly.forceRoot, Fly.attachment, Fly.hoverForce = root, attachment, force
+    end
+
+    -- Counter gravity so releasing movement keys holds altitude instead of slowly sinking.
+    Fly.hoverForce.Force = Vector3.new(0, root.AssemblyMass * workspace.Gravity, 0)
+end
+
+local function stopFly()
+    Fly.on = false
+    if flyConn then flyConn:Disconnect() flyConn = nil end
+    clearFlyHover()
+end
+
+local function startFly()
+    if Fly.on then return end
+    Fly.on = true
+    flyConn = RunService.Heartbeat:Connect(function(dt)
+        if not Fly.on then return end
+        local root = getRoot()
+        local camera = workspace.CurrentCamera
+        if not root or not camera then
+            clearFlyHover()
+            return
+        end
+        keepFlyHover(root)
+
+        local direction = Vector3.zero
+        if not UIS:GetFocusedTextBox() then
+            if UIS:IsKeyDown(Enum.KeyCode.W) then direction += camera.CFrame.LookVector end
+            if UIS:IsKeyDown(Enum.KeyCode.S) then direction -= camera.CFrame.LookVector end
+            if UIS:IsKeyDown(Enum.KeyCode.D) then direction += camera.CFrame.RightVector end
+            if UIS:IsKeyDown(Enum.KeyCode.A) then direction -= camera.CFrame.RightVector end
+            if UIS:IsKeyDown(Enum.KeyCode.Space) then direction += Vector3.yAxis end
+            if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then direction -= Vector3.yAxis end
+        end
+        if direction.Magnitude > 0 then
+            root.CFrame = root.CFrame + direction.Unit * Fly.speed * math.min(dt, 0.1)
+        end
+        root.AssemblyLinearVelocity = Vector3.zero
+    end)
+end
+
+local WalkspeedModifier = { on = false, value = 16, humanoid = nil, original = nil, walkConn = nil, charConn = nil }
+
+local function disconnectWalkspeedHumanoid(restore)
+    if WalkspeedModifier.walkConn then WalkspeedModifier.walkConn:Disconnect(); WalkspeedModifier.walkConn = nil end
+    local humanoid = WalkspeedModifier.humanoid
+    if restore and humanoid and humanoid.Parent and WalkspeedModifier.original then
+        pcall(function() humanoid.WalkSpeed = WalkspeedModifier.original end)
+    end
+    WalkspeedModifier.humanoid, WalkspeedModifier.original = nil, nil
+end
+
+local function bindWalkspeedHumanoid(character)
+    if not WalkspeedModifier.on then return end
+    disconnectWalkspeedHumanoid(false)
+    local humanoid = character and character:FindFirstChildWhichIsA("Humanoid")
+    if not humanoid then return end
+    WalkspeedModifier.humanoid = humanoid
+    WalkspeedModifier.original = humanoid.WalkSpeed
+    local function apply()
+        if WalkspeedModifier.on and humanoid.Parent and humanoid.WalkSpeed ~= WalkspeedModifier.value then
+            humanoid.WalkSpeed = WalkspeedModifier.value
+        end
+    end
+    apply()
+    WalkspeedModifier.walkConn = humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(apply)
+end
+
+local function setWalkspeedModifier(enabled)
+    WalkspeedModifier.on = enabled
+    if enabled then
+        if WalkspeedModifier.charConn then WalkspeedModifier.charConn:Disconnect() end
+        WalkspeedModifier.charConn = LocalPlayer.CharacterAdded:Connect(function(character)
+            task.defer(bindWalkspeedHumanoid, character)
+        end)
+        bindWalkspeedHumanoid(LocalPlayer.Character)
+    else
+        if WalkspeedModifier.charConn then WalkspeedModifier.charConn:Disconnect(); WalkspeedModifier.charConn = nil end
+        disconnectWalkspeedHumanoid(true)
+    end
+end
+
+MovementTab:Toggle({
+    Title = "Walkspeed Modifier",
+    Value = false,
+    Flag = "WalkspeedOn",
+    Callback = function(value) setWalkspeedModifier(value) end,
+})
+
+MovementTab:Slider({
+    Title = "Walkspeed",
+    Step = 1,
+    Value = { Min = 1, Max = 60, Default = WalkspeedModifier.value },
+    Flag = "WalkspeedValue",
+    Callback = function(value)
+        WalkspeedModifier.value = math.clamp(value, 1, 60)
+        if WalkspeedModifier.on and WalkspeedModifier.humanoid then
+            pcall(function() WalkspeedModifier.humanoid.WalkSpeed = WalkspeedModifier.value end)
+        end
+    end,
+})
+
+MovementTab:Toggle({
+    Title = "Fly",
+    Value = false,
+    Flag = "FlyOn",
+    Callback = function(v) if v then startFly() else stopFly() end end,
+})
+
+MovementTab:Slider({
+    Title = "Fly Speed",
+    Step = 1,
+    Value = { Min = 1, Max = 30, Default = Fly.speed },
+    Flag = "FlySpeed",
+    Callback = function(v) Fly.speed = math.clamp(v, 1, 30) end,
+})
+
+MovementTab:Toggle({
+    Title = "Noclip",
+    Value = false,
+    Flag = "MovementNoclip",
+    Callback = function(v) State.MovementNoclip = v refreshNoclip() end,
+})
+
+SettingsTab:Section({ Title = "Movement" })
+
+SettingsTab:Slider({
+    Title = "Tween Speed (studs/sec)",
+    Step = 5,
+    Value = { Min = 20, Max = 300, Default = Config.TweenSpeed },
+    Flag = "TweenSpeed",
+    Callback = function(v) Config.TweenSpeed = v end,
+})
+
+SettingsTab:Slider({
+    Title = "Height Above Source",
+    Step = 1,
+    Value = { Min = -10, Max = 15, Default = Config.HeightOffset },
+    Flag = "HeightOffset",
+    Callback = function(v) Config.HeightOffset = v end,
+})
+
+SettingsTab:Toggle({
+    Title = "Return To Original Position (keep ON for underground water)",
+    Value = true,
+    Flag = "ReturnBack",
+    Callback = function(v) State.ReturnBack = v end,
+})
+
+SettingsTab:Toggle({
+    Title = "Return To Original Position After EATING (off = stay at last grass)",
+    Value = false,
+    Flag = "ReturnFood",
+    Callback = function(v) State.ReturnFood = v end,
+})
+
+SettingsTab:Section({ Title = "Grass Search" })
+
+SettingsTab:Input({
+    Title = "Grass Search Radius (type 10 - 9999 studs)",
+    Value = tostring(Config.SearchRadius),
+    Placeholder = "200",
+    Flag = "SearchRadius",
+    Callback = function(text) Config.SearchRadius = parseSize(text, 10, 9999, Config.SearchRadius) end,
+})
+
+SettingsTab:Slider({
+    Title = "Search Step (studs, smaller = more thorough)",
+    Step = 1,
+    Value = { Min = 3, Max = 12, Default = Config.SearchStep },
+    Flag = "SearchStep",
+    Callback = function(v) Config.SearchStep = v end,
+})
+
+SettingsTab:Slider({
+    Title = "Search Speed (studs/sec, slower = catches prompt)",
+    Step = 5,
+    Value = { Min = 10, Max = 150, Default = Config.SearchSpeed },
+    Flag = "SearchSpeed",
+    Callback = function(v) Config.SearchSpeed = v end,
+})
+
+SettingsTab:Slider({
+    Title = "Pause At Each Search Point (sec)",
+    Step = 0.05,
+    Value = { Min = 0, Max = 1, Default = Config.SearchDwell },
+    Flag = "SearchDwell",
+    Callback = function(v) Config.SearchDwell = v end,
+})
+
+SettingsTab:Toggle({
+    Title = "Detect Grass By Eating (probe, in addition to the prompt)",
+    Value = Config.ProbeEat,
+    Flag = "ProbeEat",
+    Callback = function(v) Config.ProbeEat = v end,
+})
+
+SettingsTab:Toggle({
+    Title = "Teleport Straight To Terrain Grass (off = old prompt search)",
+    Value = true,
+    Flag = "TerrainGrass",
+    Callback = function(v) Config.FoodMode = v and "Terrain Grass" or "Prompt Search" end,
+})
+
+SettingsTab:Button({
+    Title = "Clear Learned Grass Spots",
+    Callback = function()
+        Spots.Food = {}
+        LastFood = nil
+        notify("Cleared", "Learned grass spots removed")
+    end,
+})
+
+-- open the first tab
+pcall(function() Window:SelectTab(1) end)
+
+-- Startup: restore same-server whitelist state, then optionally load selected config.
+task.spawn(function()
+    task.wait(1)
+    loadConfigPrefs()
+    loadServerSafeLists()
+    refreshConfigDropdown()
+    if AutoConfigName ~= "" then
+        SelectedAutoConfig = AutoConfigName
+        pcall(function() ConfigDropdown:Select(SelectedAutoConfig) end)
+    elseif SelectedAutoConfig ~= "" then
+        pcall(function() ConfigDropdown:Select(SelectedAutoConfig) end)
+    end
+    ConfigReady = true
+    if AutoConfigName ~= "" then
+        if loadConfig(AutoConfigName, true) then
+            notify("Config loaded", AutoConfigName)
+        else
+            notify("Auto Load failed", AutoConfigName .. " is missing or unreadable")
+        end
+    end
+    updateAutoLoadLabel()
+end)
+
+-- ================= CLEANUP (for re-running the script) =================
+env.AnimalFarmStop = function()
+    pcall(saveServerSafeLists)
+    alive = false
+    State.Cancel = true
+    if afkConn then afkConn:Disconnect() end
+    if keyConn then keyConn:Disconnect() end
+    if HitboxCleanup then pcall(HitboxCleanup) end
+    if VisualsCleanup then pcall(VisualsCleanup) end
+    stopHold()
+    setNoclip(false)
+    stopFly()
+    setWalkspeedModifier(false)
+    if noclipConn then noclipConn:Disconnect() end
+    if noclipDescendantConn then noclipDescendantConn:Disconnect() end
+    if noclipCharacterConn then noclipCharacterConn:Disconnect() end
+    pcall(function() Window:Destroy() end)
+end
