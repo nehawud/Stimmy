@@ -5170,6 +5170,89 @@ end)()
         end,
     })
 
+    local function inspectQuestUI()
+        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        local questsGui = playerGui and playerGui:FindFirstChild("QuestsScreenGui")
+        if not questsGui then
+            notify("Quest UI Inspector", "QuestsScreenGui was not found.")
+            return
+        end
+
+        local lines = {
+            "QUEST UI INSPECTOR",
+            "Root: PlayerGui.QuestsScreenGui",
+            "Objects are listed with class, path, and useful UI properties.",
+            ""
+        }
+        local inspected = 0
+        local maxObjects = 1200
+        local function getPath(item)
+            local names = {}
+            local current = item
+            while current and current ~= questsGui do
+                names[#names + 1] = current.Name
+                current = current.Parent
+            end
+            local path = "QuestsScreenGui"
+            for i = #names, 1, -1 do
+                path = path .. "." .. names[i]
+            end
+            return path
+        end
+
+        local function addLine(item)
+            if inspected >= maxObjects then return end
+            inspected += 1
+            local details = { "[" .. item.ClassName .. "] " .. getPath(item) }
+            if item:IsA("GuiObject") then
+                details[#details + 1] = "Visible=" .. tostring(item.Visible)
+            end
+            if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
+                local value = tostring(item.Text or ""):gsub("[%c]", " ")
+                if value ~= "" then details[#details + 1] = "Text=" .. value:sub(1, 180) end
+            end
+            if item:IsA("ImageLabel") or item:IsA("ImageButton") then
+                details[#details + 1] = "Image=" .. tostring(item.Image)
+            end
+            if item:IsA("UIStroke") then
+                details[#details + 1] = "StrokeColor=" .. tostring(item.Color)
+            end
+            local ok, attributes = pcall(function() return item:GetAttributes() end)
+            if ok then
+                for key, value in pairs(attributes) do
+                    details[#details + 1] = "Attr." .. tostring(key) .. "=" .. tostring(value)
+                end
+            end
+            lines[#lines + 1] = table.concat(details, " | ")
+        end
+
+        addLine(questsGui)
+        for _, item in ipairs(questsGui:GetDescendants()) do
+            if inspected >= maxObjects then break end
+            addLine(item)
+        end
+
+        local output = table.concat(lines, "\\n")
+        if type(setclipboard) == "function" then
+            local ok = pcall(setclipboard, output)
+            if ok then
+                notify("Quest UI Inspector", "Copied " .. tostring(inspected) .. " UI objects. Paste the results here.")
+            else
+                notify("Quest UI Inspector", "Couldn't copy results. Clipboard operation failed.")
+            end
+        else
+            notify("Quest UI Inspector", "Clipboard isn't supported by this executor.")
+        end
+    end
+
+    Tab:Button({
+        Title = "Inspect Quest UI",
+        Callback = function()
+            local ok, err = pcall(inspectQuestUI)
+            if not ok then notify("Quest UI Inspector", "Scan failed: " .. tostring(err)) end
+        end,
+    })
+
     Tab:Button({
         Title = "Copy Quest Results",
         Callback = function()
