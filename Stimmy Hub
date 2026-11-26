@@ -1850,17 +1850,6 @@ local function runCycle(kind, force)
     local finalMsg
     local ok, err = pcall(function()
         if kind == "Food" then
-            -- Optional carcass-first mode: use an already available carcass before
-            -- the normal grass/search behavior. If none are loaded, fall back normally.
-            if Config.PrioritizeCarcassesWhenHungry then
-                local carcassMsg = foodCarcassLoop(force, info)
-                if carcassMsg ~= "no carcasses found in loaded map" then
-                    finalMsg = carcassMsg
-                    return
-                end
-                setStatus("no carcasses found, using normal food search")
-            end
-
             local diet = getLocalDiet()
             if diet == "Carnivore" then
                 finalMsg = foodCarcassLoop(force, info)
@@ -4691,18 +4680,6 @@ end
 
 -- ================= AUTO GROW =================
 ;(function()
--- Optional carcass-first behavior for Auto Eat.
-Config.PrioritizeCarcassesWhenHungry = Config.PrioritizeCarcassesWhenHungry == true
-Tab:Section({ Title = "Auto Eat Priority" })
-Tab:Toggle({
-    Title = "Prioritize Carcasses When Hungry",
-    Value = Config.PrioritizeCarcassesWhenHungry,
-    Flag = "PrioritizeCarcassesWhenHungry",
-    Callback = function(v)
-        Config.PrioritizeCarcassesWhenHungry = v == true
-    end,
-})
-
 -- Queue saved animals, watch the active character's GrowthPercentage, then reset and spawn the next.
 Tab:Section({ Title = "Auto Grow" })
 
