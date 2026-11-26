@@ -5037,6 +5037,7 @@ end)()
     local QuestWeeklyLabel = Tab:Paragraph({ Title = "Weeklys\nNot scanned yet." })
     local QuestDailyLabel = Tab:Paragraph({ Title = "Dailys\nNot scanned yet." })
     local QuestScanStatus = Tab:Paragraph({ Title = "Quest UI Scan\nPress Scan Quest UI to inspect the visible quest interface." })
+    local QuestCopyText = "Weekly Quests:\\nNot scanned yet.\\n\\nDaily Quests:\\nNot scanned yet."
 
     local function refreshQuestLabels(weekly, daily, status)
         pcall(function() QuestWeeklyLabel:SetTitle("Weeklys\n" .. (#weekly > 0 and table.concat(weekly, "\n") or "No weekly quests detected.")) end)
@@ -5095,6 +5096,8 @@ end)()
 
         table.sort(weekly)
         table.sort(daily)
+        QuestCopyText = "Weekly Quests:\\n" .. (#weekly > 0 and table.concat(weekly, "\\n") or "No weekly quests detected.")
+            .. "\\n\\nDaily Quests:\\n" .. (#daily > 0 and table.concat(daily, "\\n") or "No daily quests detected.")
         refreshQuestLabels(weekly, daily,
             "Scanned " .. tostring(inspected) .. " visible text elements. Found "
             .. tostring(#weekly) .. " weekly and " .. tostring(#daily) .. " daily entries.")
@@ -5106,6 +5109,18 @@ end)()
             local ok, err = pcall(scanQuestUI)
             if not ok then
                 refreshQuestLabels({}, {}, "Scan failed: " .. tostring(err))
+            end
+        end,
+    })
+
+    Tab:Button({
+        Title = "Copy Quest Results",
+        Callback = function()
+            if type(setclipboard) == "function" then
+                local ok = pcall(setclipboard, QuestCopyText)
+                if not ok then notify("Auto Quest", "Couldn't copy quest results.") end
+            else
+                notify("Auto Quest", "Clipboard isn't supported by this executor.")
             end
         end,
     })
