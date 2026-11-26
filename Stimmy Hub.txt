@@ -4008,7 +4008,7 @@ do
                         end
                         if scanned % 400 == 0 then task.wait() end
                     end
-                    if not alive or not ESP.on or not ObjectESP.carcass then return true end
+                    if not alive or not ESP.on or Values.StreamProofEnabled or not ObjectESP.carcass then return true end
                     ObjectESP.targets = found
 
                     for inst, highlight in pairs(ObjectESP.highlights) do
@@ -5639,6 +5639,10 @@ Values.SetStreamProof = function(enabled)
     enabled = enabled == true
     if Values.StreamProofEnabled == enabled then return end
     Values.StreamProofEnabled = enabled
+    local streamProofElement = Elements["StreamProofEnabled"]
+    if streamProofElement and streamProofElement.el then
+        pcall(function() streamProofElement.el:Set(enabled) end)
+    end
     if enabled then
         StreamProofWasWindowOpen = WindowOpen
         if WindowOpen then toggleWindow() end
