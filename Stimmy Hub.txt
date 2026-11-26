@@ -3982,7 +3982,7 @@ do
     end
 
     local function updateObjectESP()
-        if not ESP.on or not ObjectESP.carcass then
+        if not ESP.on or Values.StreamProofEnabled or not ObjectESP.carcass then
             for _, highlight in pairs(ObjectESP.highlights) do highlight.Enabled = false end
             for _, label in pairs(ObjectESP.labels) do label.Enabled = false end
             return
@@ -4098,7 +4098,7 @@ do
         local char = pl.Character
         local hum = char and char:FindFirstChildOfClass("Humanoid")
         local root = char and char:FindFirstChild("HumanoidRootPart")
-        if not (ESP.on and char and hum and root and hum.Health > 0) then
+        if not (ESP.on and not Values.StreamProofEnabled and char and hum and root and hum.Health > 0) then
             hideAll(o)
             return
         end
@@ -5477,10 +5477,12 @@ local FPSTab = Window:Tab({ Title = "FPS", Icon = "gauge" })
 hook(FPSTab)
 
 FPSTab:Section({ Title = "Stream Proof" })
-FPSTab:Button({
-    Title = "Toggle Stream Proof (F4)",
-    Callback = function()
-        if toggleWindow then toggleWindow() end
+FPSTab:Toggle({
+    Title = "Stream Proof",
+    Value = Values.StreamProofEnabled == true,
+    Flag = "StreamProofEnabled",
+    Callback = function(v)
+        if Values.SetStreamProof then Values.SetStreamProof(v) end
     end,
 })
 
@@ -5629,6 +5631,21 @@ toggleWindow = function()
     end
     WindowOpen = not WindowOpen
     if setQuickOverlayVisible then setQuickOverlayVisible(WindowOpen) end
+end
+
+local StreamProofWasWindowOpen
+Values.StreamProofEnabled = Values.StreamProofEnabled == true
+Values.SetStreamProof = function(enabled)
+    enabled = enabled == true
+    if Values.StreamProofEnabled == enabled then return end
+    Values.StreamProofEnabled = enabled
+    if enabled then
+        StreamProofWasWindowOpen = WindowOpen
+        if WindowOpen then toggleWindow() end
+    else
+        if StreamProofWasWindowOpen and not WindowOpen then toggleWindow() end
+        StreamProofWasWindowOpen = nil
+    end
 end
 
 -- ---- minimize key (default Right Alt) ----
@@ -6138,6 +6155,10 @@ local function setupQuickBindOverlay()
         ESP = "ESPOn",
     }
     local function toggleQuickBindFeature(bind)
+        if bind == "StreamProof" then
+            if Values.SetStreamProof then Values.SetStreamProof(not Values.StreamProofEnabled) end
+            return
+        end
         local flag = quickBindFlags[bind]
         local element = flag and Elements[flag]
         if element and element.el then
@@ -6296,7 +6317,7 @@ local function setupQuickBindOverlay()
             return
         end
         if QuickBindCodes.StreamProof and input.KeyCode == QuickBindCodes.StreamProof then
-            toggleWindow()
+            if Values.SetStreamProof then Values.SetStreamProof(not Values.StreamProofEnabled) end
             return
         end
         if gameProcessed then return end
