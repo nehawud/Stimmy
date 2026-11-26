@@ -2118,6 +2118,7 @@ local QuickBindCodes = {
     Noclip = Enum.KeyCode.V,
     ESP = Enum.KeyCode.F1,
     Teleport = Enum.KeyCode.B,
+    StreamProof = Enum.KeyCode.F4,
 }
 for bind, keyCode in pairs(QuickBindCodes) do
     Values["QuickBind_" .. bind] = keyCode.Name
@@ -5648,6 +5649,7 @@ MenuTab:Dropdown({
         "Fly",
         "Noclip",
         "ESP",
+        "Stream Proof",
     },
     Value = {},
     Multi = true,
@@ -6114,6 +6116,7 @@ local function setupQuickBindOverlay()
         { key = "Fly", label = "Fly" },
         { key = "Noclip", label = "Noclip" },
         { key = "ESP", label = "ESP" },
+        { key = "StreamProof", label = "Stream Proof" },
     }
     local QuickBindRowFrames = {}
     local quickBindFlags = {
@@ -6281,6 +6284,10 @@ local function setupQuickBindOverlay()
             elseif input.KeyCode ~= Enum.KeyCode.Unknown then
                 updateQuickBind(bind, input.KeyCode)
             end
+            return
+        end
+        if QuickBindCodes.StreamProof and input.KeyCode == QuickBindCodes.StreamProof then
+            toggleWindow()
             return
         end
         if gameProcessed then return end
