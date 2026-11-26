@@ -4744,6 +4744,18 @@ local function getSavedCardData(savedName)
         if ancestor == root then break end
         ancestor = ancestor.Parent
     end
+    -- The saved-card UI can lag behind the active animal. Prefer its live
+    -- GrowthPercentage while this exact saved character is currently spawned.
+    local activeCharacter = LocalPlayer.Character
+    if activeCharacter then
+        local activeName = activeCharacter:GetAttribute("UniqueCharacterName")
+            or activeCharacter:GetAttribute("CharacterName")
+        if activeName == savedName then
+            local liveGrowth = activeCharacter:GetAttribute("GrowthPercentage")
+            if type(liveGrowth) == "number" then growth = liveGrowth end
+        end
+    end
+
     return species, growth
 end
 
@@ -5005,17 +5017,26 @@ Tab:Toggle({
 
 -- One lightweight growth check; no character scanning or per-frame work.
 task.spawn(function()
+    local lastDropdownGrowth = nil
     while alive do
         task.wait(0.5)
         if AutoGrow.on and AutoGrow.current and not AutoGrow.busy then
             local char = LocalPlayer.Character
             local growth = char and char:GetAttribute("GrowthPercentage")
             if type(growth) == "number" then
+                local dropdownGrowth = math.floor(math.clamp(growth > 1 and growth or growth * 100, 0, 100) + 0.5)
+                if dropdownGrowth ~= lastDropdownGrowth then
+                    lastDropdownGrowth = dropdownGrowth
+                    -- Refresh the dropdown so the active animal's displayed percentage
+                    -- follows its live growth instead of the stale saved-card value.
+                    pcall(refreshAutoGrowOptions)
+                end
                 local normalizedGrowth = growth > 1 and (growth / 100) or growth
                 local percent = math.floor(math.clamp(normalizedGrowth, 0, 1) * 100 + 0.5)
                 local current = AutoGrow.current
                 if percent >= 100 then
-                    AutoGrow.tracker[#AutoGrow.tracker + 1] = current.display .. " | Growth: Complete"
+                    local trackerName = current.display:gsub(" | [%d%.]+%%$", "")
+                    AutoGrow.tracker[#AutoGrow.tracker + 1] = trackerName .. " | Growth: Complete"
                     refreshGrowthTracker()
                     table.remove(AutoGrow.queue, 1)
                     refreshAutoGrowOptions()
@@ -5023,7 +5044,10 @@ task.spawn(function()
                     AutoGrow.busy = false
                     spawnNextGrowthAnimal()
                 else
-                    local line = current.display .. " | Growth: " .. tostring(percent) .. "% | Ongoing"
+                    -- The dropdown label already contains the starting percentage;
+                    -- omit that stale suffix from the tracker entry.
+                    local trackerName = current.display:gsub(" | [%d%.]+%%$", "")
+                    local line = trackerName .. " | Growth: " .. tostring(percent) .. "% | Ongoing"
                     local last = AutoGrow.tracker[#AutoGrow.tracker]
                     if last ~= line then
                         if last and last:find(current.display, 1, true) and last:find("Ongoing", 1, true) then
