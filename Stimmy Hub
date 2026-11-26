@@ -5245,20 +5245,30 @@ hook(MiscTab)
 MiscTab:Section({ Title = "Move Slots" })
 
 local MoveSlotNames = getSavedCharacterNames()
-local MoveSlotSelected = MoveSlotNames[1]
+local MoveSlotSelected = {}
 local MoveSlotNumber = "1"
 
 local MoveSlotDropdown = MiscTab:Dropdown({
-    Title = "Select Animal",
+    Title = "Select Animals",
     Values = MoveSlotNames,
-    Value = MoveSlotSelected,
-    Multi = false,
-    AllowNone = false,
+    Multi = true,
+    AllowNone = true,
     SearchBarEnabled = true,
     Callback = function(value)
-        local selected = type(value) == "table" and (value.Title or value.Name or value[1]) or value
-        if type(selected) == "string" and selected ~= "" then
-            MoveSlotSelected = selected
+        MoveSlotSelected = {}
+        if type(value) == "table" then
+            for _, selected in pairs(value) do
+                if type(selected) == "string" and selected ~= "" then
+                    table.insert(MoveSlotSelected, selected)
+                elseif type(selected) == "table" then
+                    local name = selected.Title or selected.Name or selected.Value
+                    if type(name) == "string" and name ~= "" then
+                        table.insert(MoveSlotSelected, name)
+                    end
+                end
+            end
+        elseif type(value) == "string" and value ~= "" then
+            MoveSlotSelected = { value }
         end
     end,
 })
@@ -5273,12 +5283,12 @@ MiscTab:Input({
 })
 
 MiscTab:Button({
-    Title = "Move Selected Animal",
+    Title = "Move Selected Animals",
     Callback = function()
         local selected = MoveSlotSelected
         local slot = tonumber(MoveSlotNumber)
-        if not selected or selected == "" then
-            notify("Move Slots", "Select an animal first.")
+        if #selected == 0 then
+            notify("Move Slots", "Select at least one animal first.")
             return
         end
         if not slot or slot < 1 or slot % 1 ~= 0 then
@@ -5292,14 +5302,20 @@ MiscTab:Button({
             return
         end
 
-        local ok, result = pcall(function()
-            return moveRemote:InvokeServer(selected, slot)
-        end)
-        if ok and result ~= false then
-            notify("Move Slots", "Move request sent for " .. selected .. " to slot " .. tostring(slot) .. ".")
-        else
-            notify("Move Slots", "Move failed: " .. tostring(result))
+        local moved = 0
+        local failed = 0
+        for _, animalName in ipairs(selected) do
+            local ok, result = pcall(function()
+                return moveRemote:InvokeServer(animalName, slot)
+            end)
+            if ok and result ~= false then
+                moved = moved + 1
+            else
+                failed = failed + 1
+            end
         end
+
+        notify("Move Slots", "Moved: " .. tostring(moved) .. " | Failed: " .. tostring(failed) .. " | Destination: " .. tostring(slot))
     end,
 })
 
