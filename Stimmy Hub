@@ -3468,6 +3468,7 @@ do
                     if refreshHitList then refreshHitList() end
                     if refreshAuraList then refreshAuraList() end
                     if ConfigReady then task.defer(saveServerSafeLists) end
+                    notify("Animal Whitelisted", tostring(animalName) .. " (@" .. player.Name .. ")")
                 end
             end
 
