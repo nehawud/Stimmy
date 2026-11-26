@@ -5284,30 +5284,41 @@ local function getMoveSlotSpecies(savedName)
 end
 
 local MoveSlotNames = getSavedCharacterNames()
+local MoveSlotOptions = {}
+local MoveSlotDisplayToName = {}
 local MoveSlotSelected = {}
 local MoveSlotNumber = "1"
 
+for _, savedName in ipairs(MoveSlotNames) do
+    local species = getMoveSlotSpecies(savedName)
+    local display = species .. " (" .. savedName .. ")"
+    MoveSlotOptions[#MoveSlotOptions + 1] = display
+    MoveSlotDisplayToName[display] = savedName
+end
+
 local MoveSlotDropdown = MiscTab:Dropdown({
     Title = "Select Animals",
-    Values = MoveSlotNames,
+    Values = MoveSlotOptions,
     Multi = true,
     AllowNone = true,
     SearchBarEnabled = true,
     Callback = function(value)
         MoveSlotSelected = {}
+        local function addSelection(display)
+            if type(display) == "string" and display ~= "" then
+                table.insert(MoveSlotSelected, MoveSlotDisplayToName[display] or display)
+            end
+        end
         if type(value) == "table" then
             for _, selected in pairs(value) do
-                if type(selected) == "string" and selected ~= "" then
-                    table.insert(MoveSlotSelected, selected)
+                if type(selected) == "string" then
+                    addSelection(selected)
                 elseif type(selected) == "table" then
-                    local name = selected.Title or selected.Name or selected.Value
-                    if type(name) == "string" and name ~= "" then
-                        table.insert(MoveSlotSelected, name)
-                    end
+                    addSelection(selected.Title or selected.Name or selected.Value)
                 end
             end
-        elseif type(value) == "string" and value ~= "" then
-            MoveSlotSelected = { value }
+        elseif type(value) == "string" then
+            addSelection(value)
         end
     end,
 })
