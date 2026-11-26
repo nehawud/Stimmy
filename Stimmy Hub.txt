@@ -3351,7 +3351,16 @@ do
             local function animalNameMatches(animalName, query)
                 local animal, wanted = normalizeName(animalName), normalizeName(query)
                 if #wanted < 2 or #animal == 0 then return false end
-                if animal:find(wanted, 1, true) then return true end
+                if animal == wanted or animal:find(wanted, 1, true) then return true end
+
+                -- Match initials/acronyms too: "Never Back Away", "N.B.A",
+                -- and "N B A" all resolve to the same three-letter combination.
+                local initials = {}
+                for word in tostring(animalName):gmatch("[%w]+") do
+                    initials[#initials + 1] = word:sub(1, 1):lower()
+                end
+                local acronym = table.concat(initials)
+                if #wanted >= 2 and acronym == wanted then return true end
 
                 -- Also accept a close spelling: compare query-sized chunks and
                 -- allow one insertion, deletion, or substitution.
