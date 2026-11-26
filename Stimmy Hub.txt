@@ -559,7 +559,50 @@ end
 -- Shared travel method for shoreline/grass approach movement.
 local function moveToShore(targetPos, ignoreCancel)
     if Config.TravelMethod ~= "Blink" then
-        return moveTo(targetPos, ignoreCancel)
+        -- Tree canopies/trunks can collide with the character during a straight tween
+        -- and force the root downward. Temporarily soften only named tree parts along
+        -- the travel corridor, then restore their original collision state.
+        local root = getRoot()
+        if not root then return false end
+        local origin = root.Position
+        local delta = targetPos - origin
+        local steps = math.min(math.ceil(delta.Magnitude / 6), 60)
+        local params = OverlapParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { LocalPlayer.Character }
+        params.MaxParts = 150
+        local changed = {}
+        for sample = 0, steps do
+            local point = origin + delta * (sample / math.max(steps, 1))
+            for _, part in ipairs(workspace:GetPartBoundsInRadius(point, 10, params)) do
+                if part:IsA("BasePart") and changed[part] == nil then
+                    local node = part
+                    local isTree = false
+                    for _ = 1, 6 do
+                        if not node then break end
+                        local name = node.Name:lower()
+                        if name:find("tree", 1, true) or name:find("trunk", 1, true)
+                            or name:find("branch", 1, true) or name:find("foliage", 1, true)
+                            or name:find("canopy", 1, true) or name:find("leaves", 1, true)
+                            or name:find("leaf", 1, true) or name:find("oak", 1, true)
+                            or name:find("pine", 1, true) then
+                            isTree = true
+                            break
+                        end
+                        node = node.Parent
+                    end
+                    if isTree then
+                        changed[part] = part.CanCollide
+                        part.CanCollide = false
+                    end
+                end
+            end
+        end
+        local ok, arrived = pcall(moveTo, targetPos, ignoreCancel)
+        for part, wasCollidable in pairs(changed) do
+            if part.Parent then part.CanCollide = wasCollidable end
+        end
+        return ok and arrived == true
     end
 
     -- Blink advances in short hops rather than making one long movement.
