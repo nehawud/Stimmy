@@ -3401,8 +3401,9 @@ do
                                 if value then
                                     local lower = value:lower()
                                     -- Ignore species/age/gender/status lines from the nameplate.
-                                    if not lower:find("|", 1, true)
-                                        and not lower:find("gallimimus", 1, true)
+                                    -- Keep pipe-separated custom names such as "SAK|TDC";
+                                    -- normalizeName() removes separators before matching.
+                                    if not lower:find("gallimimus", 1, true)
                                         and not lower:find("juvenile", 1, true)
                                         and not lower:find("adult", 1, true)
                                         and not lower:find("female", 1, true)
