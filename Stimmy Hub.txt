@@ -5472,8 +5472,17 @@ task.spawn(function()
 end)
 
 -- ================= TAB: FPS =================
+local toggleWindow
 local FPSTab = Window:Tab({ Title = "FPS", Icon = "gauge" })
 hook(FPSTab)
+
+FPSTab:Section({ Title = "Stream Proof" })
+FPSTab:Button({
+    Title = "Toggle Stream Proof (F4)",
+    Callback = function()
+        if toggleWindow then toggleWindow() end
+    end,
+})
 
 FPSTab:Section({ Title = "Rain Control" })
 FPSTab:Toggle({
@@ -5604,12 +5613,12 @@ local SettingsTab = Window:Tab({ Title = "Settings", Icon = "settings" })
 hook(SettingsTab)
 
 -- ================= TAB 3: MENU (minimize key) =================
-local WindowOpen = true
+WindowOpen = true
 local MenuTab = Window:Tab({ Title = "Menu", Icon = "menu" })
 hook(MenuTab)
 
 -- open / close the window using the minimize key
-local function toggleWindow()
+toggleWindow = function()
     local ok = pcall(function() Window:Toggle() end)
     if not ok then
         if WindowOpen then
