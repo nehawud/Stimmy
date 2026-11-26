@@ -5070,12 +5070,27 @@ end)()
         return table.concat(parts, "|")
     end
 
+    local function clickQuestTab(button)
+        if type(firesignal) ~= "function" then
+            return false, "executor does not support firesignal"
+        end
+        local clicked, clickError = pcall(function()
+            firesignal(button.Activated)
+        end)
+        if clicked then return true end
+        local mouseClicked, mouseError = pcall(function()
+            firesignal(button.MouseButton1Click)
+        end)
+        if mouseClicked then return true end
+        return false, tostring(clickError or mouseError)
+    end
+
     local function scanQuestTab(button, scrollingFrame)
         if not button or not button:IsA("GuiButton") then
             return {}, "tab button was not found"
         end
-        local activated, activateError = pcall(function() button:Activate() end)
-        if not activated then return {}, "couldn't open tab: " .. tostring(activateError) end
+        local clicked, clickError = clickQuestTab(button)
+        if not clicked then return {}, "couldn't click tab: " .. tostring(clickError) end
         task.wait(0.5)
 
         if not scrollingFrame or not scrollingFrame.Parent then
@@ -5162,7 +5177,8 @@ end)()
         local weekly, weeklyInfo = scanQuestTab(weeklyButton, scrollingFrame)
 
         local restoreButton = originalTab == "weekly" and weeklyButton or dailyButton
-        pcall(function() restoreButton:Activate() end)
+        clickQuestTab(restoreButton)
+        task.wait(0.2)
 
         QuestCopyText = "Weekly Quests:\\n" .. (#weekly > 0 and table.concat(weekly, "\\n") or "No weekly quests detected.")
             .. "\\n\\nDaily Quests:\\n" .. (#daily > 0 and table.concat(daily, "\\n") or "No daily quests detected.")
