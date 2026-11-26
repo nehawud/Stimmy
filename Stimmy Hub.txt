@@ -5036,7 +5036,7 @@ end)()
 
     local QuestWeeklyLabel = Tab:Paragraph({ Title = "Weeklys\nNot scanned yet." })
     local QuestDailyLabel = Tab:Paragraph({ Title = "Dailys\nNot scanned yet." })
-    local QuestScanStatus = Tab:Paragraph({ Title = "Quest UI Scan\nPress Scan Quest UI to inspect the visible quest interface." })
+    local QuestScanStatus = Tab:Paragraph({ Title = "Quest UI Scan\nPress Scan Quest UI to inspect QuestsScreenGui.Frame." })
     local QuestCopyText = "Weekly Quests:\\nNot scanned yet.\\n\\nDaily Quests:\\nNot scanned yet."
 
     local function refreshQuestLabels(weekly, daily, status)
@@ -5052,27 +5052,40 @@ end)()
             return
         end
 
+        local questsGui = playerGui:FindFirstChild("QuestsScreenGui")
+        if not questsGui then
+            refreshQuestLabels({}, {}, "QuestsScreenGui was not found.")
+            return
+        end
+
+        local questFrame = questsGui:FindFirstChild("Frame")
+        if not questFrame then
+            refreshQuestLabels({}, {}, "QuestsScreenGui.Frame was not found.")
+            return
+        end
+
         local weekly, daily, seen = {}, {}, {}
         local inspected = 0
         local function visibleText(item)
             if not (item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox")) then return nil end
             local current = item
-            while current and current ~= playerGui do
+            while current and current ~= questFrame do
                 if current:IsA("GuiObject") and not current.Visible then return nil end
                 current = current.Parent
             end
+            if current ~= questFrame then return nil end
             local value = tostring(item.Text or ""):gsub("^%s*(.-)%s*$", "%1")
             if value == "" or #value > 180 then return nil end
             return value
         end
 
-        for _, item in ipairs(playerGui:GetDescendants()) do
+        for _, item in ipairs(questFrame:GetDescendants()) do
             local value = visibleText(item)
             if value then
                 inspected += 1
                 local category, ancestor = nil, item
                 for _ = 1, 10 do
-                    if not ancestor or ancestor == playerGui then break end
+                    if not ancestor or ancestor == questFrame then break end
                     local key = (ancestor.Name or ""):lower()
                     local label = ""
                     if ancestor:IsA("TextLabel") or ancestor:IsA("TextButton") then
@@ -5099,7 +5112,7 @@ end)()
         QuestCopyText = "Weekly Quests:\\n" .. (#weekly > 0 and table.concat(weekly, "\\n") or "No weekly quests detected.")
             .. "\\n\\nDaily Quests:\\n" .. (#daily > 0 and table.concat(daily, "\\n") or "No daily quests detected.")
         refreshQuestLabels(weekly, daily,
-            "Scanned " .. tostring(inspected) .. " visible text elements. Found "
+            "Scanned " .. tostring(inspected) .. " visible text elements inside QuestsScreenGui.Frame. Found "
             .. tostring(#weekly) .. " weekly and " .. tostring(#daily) .. " daily entries.")
     end
 
