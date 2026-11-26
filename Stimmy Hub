@@ -4781,7 +4781,13 @@ local AutoGrowOptions, AutoGrowDisplayToName = {}, {}
 local AutoGrowRefreshing = false
 local AutoGrowDropdown
 local function refreshAutoGrowOptions()
+    local selectedNames = {}
+    for _, queued in ipairs(AutoGrow.queue) do
+        if queued and queued.name then selectedNames[#selectedNames + 1] = queued.name end
+    end
+
     AutoGrowOptions, AutoGrowDisplayToName = {}, {}
+    local displayByName = {}
     for _, savedName in ipairs(getSavedCharacterNames()) do
         if not isSavedAnimalComplete(savedName) and not tostring(savedName):match("^#+$") then
             local species, growth = getSavedCardData(savedName)
@@ -4791,11 +4797,32 @@ local function refreshAutoGrowOptions()
             local display = savedName .. " | " .. species .. " | " .. growthText
             AutoGrowOptions[#AutoGrowOptions + 1] = display
             AutoGrowDisplayToName[display] = savedName
+            displayByName[savedName] = display
         end
     end
+
+    -- Keep the queue keyed by saved-character name while the visible percentage changes.
+    local refreshedQueue, selectedDisplays = {}, {}
+    for _, savedName in ipairs(selectedNames) do
+        local display = displayByName[savedName]
+        if display then
+            refreshedQueue[#refreshedQueue + 1] = { name = savedName, display = display }
+            selectedDisplays[#selectedDisplays + 1] = display
+        end
+    end
+    AutoGrow.queue = refreshedQueue
+    if AutoGrow.current and displayByName[AutoGrow.current.name] then
+        AutoGrow.current.display = displayByName[AutoGrow.current.name]
+    end
+
     if AutoGrowDropdown then
         AutoGrowRefreshing = true
-        pcall(function() AutoGrowDropdown:Refresh(AutoGrowOptions, true) end)
+        pcall(function()
+            AutoGrowDropdown:Refresh(AutoGrowOptions)
+            if #selectedDisplays > 0 then
+                AutoGrowDropdown:Select(selectedDisplays)
+            end
+        end)
         AutoGrowRefreshing = false
     end
 end
@@ -4870,6 +4897,8 @@ end
 
 Tab:Button({ Title = "Clear Growth Tracker", Callback = function()
     AutoGrow.tracker = {}
+    AutoGrow.trackerIndex = nil
+    AutoGrow.trackerActiveName = nil
     refreshGrowthTracker()
 end })
 
@@ -4900,6 +4929,8 @@ local function spawnNextGrowthAnimal()
     end
     AutoGrow.busy = true
     AutoGrow.current = AutoGrow.queue[1]
+    AutoGrow.trackerIndex = nil
+    AutoGrow.trackerActiveName = AutoGrow.current and AutoGrow.current.name or nil
     pauseEatDrinkForGrowth()
     task.spawn(function()
         local target = AutoGrow.current
@@ -5034,9 +5065,19 @@ task.spawn(function()
                 local normalizedGrowth = growth > 1 and (growth / 100) or growth
                 local percent = math.floor(math.clamp(normalizedGrowth, 0, 1) * 100 + 0.5)
                 local current = AutoGrow.current
+                local trackerName = current.display:gsub(" | [%d%.]+%%$", "")
+                if AutoGrow.trackerActiveName ~= current.name then
+                    AutoGrow.trackerActiveName = current.name
+                    AutoGrow.trackerIndex = nil
+                end
                 if percent >= 100 then
-                    local trackerName = current.display:gsub(" | [%d%.]+%%$", "")
-                    AutoGrow.tracker[#AutoGrow.tracker + 1] = trackerName .. " | Growth: Complete"
+                    local line = trackerName .. " | Growth: Complete"
+                    if AutoGrow.trackerIndex and AutoGrow.tracker[AutoGrow.trackerIndex] then
+                        AutoGrow.tracker[AutoGrow.trackerIndex] = line
+                    else
+                        AutoGrow.tracker[#AutoGrow.tracker + 1] = line
+                    end
+                    AutoGrow.trackerIndex = nil
                     refreshGrowthTracker()
                     table.remove(AutoGrow.queue, 1)
                     refreshAutoGrowOptions()
@@ -5044,19 +5085,14 @@ task.spawn(function()
                     AutoGrow.busy = false
                     spawnNextGrowthAnimal()
                 else
-                    -- The dropdown label already contains the starting percentage;
-                    -- omit that stale suffix from the tracker entry.
-                    local trackerName = current.display:gsub(" | [%d%.]+%%$", "")
                     local line = trackerName .. " | Growth: " .. tostring(percent) .. "% | Ongoing"
-                    local last = AutoGrow.tracker[#AutoGrow.tracker]
-                    if last ~= line then
-                        if last and last:find(current.display, 1, true) and last:find("Ongoing", 1, true) then
-                            AutoGrow.tracker[#AutoGrow.tracker] = line
-                        else
-                            AutoGrow.tracker[#AutoGrow.tracker + 1] = line
-                        end
-                        refreshGrowthTracker()
+                    if AutoGrow.trackerIndex and AutoGrow.tracker[AutoGrow.trackerIndex] then
+                        AutoGrow.tracker[AutoGrow.trackerIndex] = line
+                    else
+                        AutoGrow.tracker[#AutoGrow.tracker + 1] = line
+                        AutoGrow.trackerIndex = #AutoGrow.tracker
                     end
+                    refreshGrowthTracker()
                 end
             end
         end
