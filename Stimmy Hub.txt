@@ -5725,22 +5725,24 @@ MovementTab:Toggle({
     Callback = function(v) Config.WaterWalkEnabled = v == true end,
 })
 
-local _waterWalkActive = false
-local waterWalkConn = RunService.Stepped:Connect(function()
-    if Config.WaterWalkEnabled then
-        if not _waterWalkActive then
-            local waterPart = workspace:FindFirstChild("MainWaterPart")
-            if waterPart then
-                waterPart.CanCollide = true
-                _waterWalkActive = true
+(function()
+    local waterWalkActive = false
+    RunService.Stepped:Connect(function()
+        if Config.WaterWalkEnabled then
+            if not waterWalkActive then
+                local waterPart = workspace:FindFirstChild("MainWaterPart")
+                if waterPart then
+                    waterPart.CanCollide = true
+                    waterWalkActive = true
+                end
             end
+        elseif waterWalkActive then
+            local waterPart = workspace:FindFirstChild("MainWaterPart")
+            if waterPart then waterPart.CanCollide = false end
+            waterWalkActive = false
         end
-    elseif _waterWalkActive then
-        local waterPart = workspace:FindFirstChild("MainWaterPart")
-        if waterPart then waterPart.CanCollide = false end
-        _waterWalkActive = false
-    end
-end)
+    end)
+end)()
 
 -- Separate quick-bind overlay. It follows the main window's visibility.
 local function setupQuickBindOverlay()
