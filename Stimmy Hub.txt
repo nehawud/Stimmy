@@ -5123,10 +5123,8 @@ end)()
                         local lower = description:lower()
                         if lower:find("travel", 1, true) and lower:find("distance", 1, true) then
                             entry.farmType = "Travel"
-                        elseif lower:find("swim", 1, true) and lower:find("distance", 1, true) then
-                            entry.farmType = "Swim"
+                            results[#results + 1] = entry
                         end
-                        results[#results + 1] = entry
                     end
                 end
             end
@@ -5248,25 +5246,11 @@ end)()
         if not waitForNeeds() then return end
         local root = getRoot()
         if not root then return end
+        if kind ~= "Travel" then return end
         local center, radius, count, standOff
-        if kind == "Travel" then
-            center = root.Position
-            radius, count = 18, 12
-            standOff = questStandOff(root)
-        else
-            local shore, _, waterPoint = findShoreTarget(root.Position, {})
-            if not shore or not waterPoint then return end
-            local inward = Vector3.new(waterPoint.X - shore.X, 0, waterPoint.Z - shore.Z)
-            if inward.Magnitude < 0.1 then inward = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z) end
-            if inward.Magnitude < 0.1 then inward = Vector3.new(1, 0, 0) end
-            inward = inward.Unit
-            center = Vector3.new(
-                waterPoint.X + inward.X * 7,
-                waterPoint.Y - 1.5,
-                waterPoint.Z + inward.Z * 7
-            )
-            radius, count = 4, 8
-        end
+        center = root.Position
+        radius, count = 18, 12
+        standOff = questStandOff(root)
 
         for step = 1, count do
             if not alive or not AutoQuest.on or State.Cancel or not getRoot() then break end
@@ -5275,12 +5259,8 @@ end)()
             local x = center.X + math.cos(angle) * radius
             local z = center.Z + math.sin(angle) * radius
             local target
-            if kind == "Travel" then
-                local y = groundY(x, z, center.Y)
-                if y then target = Vector3.new(x, y + standOff, z) end
-            else
-                target = Vector3.new(x, center.Y, z)
-            end
+            local y = groundY(x, z, center.Y)
+            if y then target = Vector3.new(x, y + standOff, z) end
             if target then
                 moveToShore(target)
                 task.wait(0.1)
