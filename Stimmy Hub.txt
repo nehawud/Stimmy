@@ -1578,6 +1578,10 @@ local function waterShoreLoop(force, info)
                 skip[key] = tick() + 120
                 fails += 1
             else
+                -- Keep the character at its actual arrival height. If a tree pushed it
+                -- downward during the tween, don't snap it back into the canopy/ground.
+                local arrivedRoot = getRoot()
+                if arrivedRoot then target = arrivedRoot.Position end
                 -- the game cancels drinking unless you are looking at the water, so face the nearest water cell
                 local face
                 if Config.FaceWater and cell then
