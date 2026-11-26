@@ -566,6 +566,7 @@ local function moveToShore(targetPos, ignoreCancel)
     local root = getRoot()
     if not root then return false end
     local started = tick()
+    local accumulated = 0
     local maxTime = (root.Position - targetPos).Magnitude / math.max(Config.TweenSpeed, 1) * 2 + 8
     while alive do
         if State.Cancel and not ignoreCancel then return false end
@@ -575,13 +576,19 @@ local function moveToShore(targetPos, ignoreCancel)
         local distance = delta.Magnitude
         if distance < 0.5 then return true end
         if tick() - started > maxTime then return false end
-        -- Move smoothly instead of teleporting the full 4-stud hop.
-        -- TweenSpeed controls travel speed, while 4 studs remains the
-        -- maximum distance covered in any single movement step.
+        -- Blink jumps in discrete 1-stud increments instead of tweening.
+        -- TweenSpeed controls the number of one-stud jumps per second.
         local dt = RunService.Heartbeat:Wait()
-        local hop = math.min(distance, 4, math.max(Config.TweenSpeed, 1) * dt)
-        if hop > 0 then
-            root.CFrame = root.CFrame + delta.Unit * hop
+        accumulated = accumulated + math.max(Config.TweenSpeed, 1) * dt
+        local jumps = math.floor(accumulated)
+        accumulated = accumulated - jumps
+        for _ = 1, jumps do
+            root = getRoot()
+            if not root then return false end
+            delta = targetPos - root.Position
+            distance = delta.Magnitude
+            if distance < 0.5 then return true end
+            root.CFrame = root.CFrame + delta.Unit * math.min(1, distance)
             root.AssemblyLinearVelocity = Vector3.zero
         end
     end
