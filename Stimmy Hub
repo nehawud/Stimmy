@@ -5244,6 +5244,45 @@ hook(MiscTab)
 
 MiscTab:Section({ Title = "Move Slots" })
 
+local function getMoveSlotSpecies(savedName)
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local savedScreen = playerGui and playerGui:FindFirstChild("SavedCharactersScreenGui")
+    local root = savedScreen and savedScreen:FindFirstChild("CharactersFrame", true)
+    if not root then return "Unknown animal" end
+
+    for _, item in ipairs(root:GetDescendants()) do
+        local unique = item:GetAttribute("UniqueCharacterName")
+            or item:GetAttribute("CharacterName")
+        local matches = unique == savedName
+        if not matches and (item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox")) then
+            matches = tostring(item.Text or ""):gsub("^%s*(.-)%s*$", "%1") == savedName
+        end
+        if matches then
+            local ancestor = item
+            for _ = 1, 12 do
+                if not ancestor then break end
+                local species
+                local function inspect(instance)
+                    local animal = instance:GetAttribute("AnimalName")
+                    if type(animal) == "string" and animal ~= "" then species = species or animal end
+                    if instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox") then
+                        local txt = tostring(instance.Text or ""):gsub("^%s*(.-)%s*$", "%1")
+                        local found = txt:match("^[Mm]ale%s+(.+)$") or txt:match("^[Ff]emale%s+(.+)$")
+                        if found and found ~= "" then species = species or found end
+                    end
+                end
+                inspect(ancestor)
+                for _, child in ipairs(ancestor:GetDescendants()) do inspect(child) end
+                if species then return species end
+                if ancestor == root then break end
+                ancestor = ancestor.Parent
+            end
+            break
+        end
+    end
+    return "Unknown animal"
+end
+
 local MoveSlotNames = getSavedCharacterNames()
 local MoveSlotSelected = {}
 local MoveSlotNumber = "1"
@@ -5308,7 +5347,8 @@ MiscTab:Button({
         local failedNames = {}
 
         for index, animalName in ipairs(selected) do
-            notify("Move Slots", "Moving " .. animalName .. " (" .. tostring(index) .. "/" .. tostring(#selected) .. ") to slot " .. tostring(slot) .. "...")
+            local species = getMoveSlotSpecies(animalName)
+            notify("Move Slots", "Moving " .. species .. " (" .. tostring(index) .. "/" .. tostring(#selected) .. ") to slot " .. tostring(slot) .. "...")
 
             local ok, result = pcall(function()
                 return moveRemote:InvokeServer(animalName, slot)
@@ -5316,10 +5356,10 @@ MiscTab:Button({
 
             if ok and result ~= false then
                 moved = moved + 1
-                table.insert(movedNames, animalName)
+                table.insert(movedNames, species)
             else
                 failed = failed + 1
-                table.insert(failedNames, animalName)
+                table.insert(failedNames, species)
             end
 
             if index < #selected then
