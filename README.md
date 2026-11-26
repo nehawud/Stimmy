@@ -1,1 +1,1 @@
-# SVL---Stimmy
+# Stimmy
