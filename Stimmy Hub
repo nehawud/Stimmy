@@ -5237,6 +5237,71 @@ task.spawn(function()
     end
 end)
 
+-- ================= TAB: MISC =================
+local MiscTab = Window:Tab({ Title = "Misc", Icon = "package" })
+hook(MiscTab)
+
+MiscTab:Section({ Title = "Move Slots" })
+
+local MoveSlotNames = getSavedCharacterNames()
+local MoveSlotSelected = MoveSlotNames[1]
+local MoveSlotNumber = "1"
+
+local MoveSlotDropdown = MiscTab:Dropdown({
+    Title = "Select Animal",
+    Values = MoveSlotNames,
+    Value = MoveSlotSelected,
+    Multi = false,
+    AllowNone = false,
+    SearchBarEnabled = true,
+    Callback = function(value)
+        local selected = type(value) == "table" and (value.Title or value.Name or value[1]) or value
+        if type(selected) == "string" and selected ~= "" then
+            MoveSlotSelected = selected
+        end
+    end,
+})
+
+MiscTab:Input({
+    Title = "Destination Slot",
+    Placeholder = "Enter slot number",
+    Value = MoveSlotNumber,
+    Callback = function(value)
+        MoveSlotNumber = tostring(value or "")
+    end,
+})
+
+MiscTab:Button({
+    Title = "Move Selected Animal",
+    Callback = function()
+        local selected = MoveSlotSelected
+        local slot = tonumber(MoveSlotNumber)
+        if not selected or selected == "" then
+            notify("Move Slots", "Select an animal first.")
+            return
+        end
+        if not slot or slot < 1 or slot % 1 ~= 0 then
+            notify("Move Slots", "Enter a valid positive slot number.")
+            return
+        end
+
+        local moveRemote = RS:FindFirstChild("MoveCharacterRemoteFunction")
+        if not moveRemote or not moveRemote:IsA("RemoteFunction") then
+            notify("Move Slots", "MoveCharacterRemoteFunction was not found.")
+            return
+        end
+
+        local ok, result = pcall(function()
+            return moveRemote:InvokeServer(selected, slot)
+        end)
+        if ok and result ~= false then
+            notify("Move Slots", "Move request sent for " .. selected .. " to slot " .. tostring(slot) .. ".")
+        else
+            notify("Move Slots", "Move failed: " .. tostring(result))
+        end
+    end,
+})
+
 -- ================= TAB: FPS =================
 local toggleWindow
 local FPSTab = Window:Tab({ Title = "FPS", Icon = "gauge" })
