@@ -5076,43 +5076,54 @@ end)()
         end
         local activated, activateError = pcall(function() button:Activate() end)
         if not activated then return {}, "couldn't open tab: " .. tostring(activateError) end
-        task.wait(0.35)
+        task.wait(0.5)
 
         if not scrollingFrame or not scrollingFrame.Parent then
             return {}, "RefScrollingFrame was not found"
         end
 
-        local results, seen = {}, {}
-        local inspected = 0
+        local results, inspected = {}, 0
+        local function getVisibleText(root, objectName)
+            local item = root:FindFirstChild(objectName, true)
+            if not item or not (item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox")) then
+                return ""
+            end
+            local current = item
+            while current and current ~= root do
+                if current:IsA("GuiObject") and not current.Visible then return "" end
+                current = current.Parent
+            end
+            if current ~= root then return "" end
+            return tostring(item.Text or ""):gsub("^%s*(.-)%s*$", "%1")
+        end
+
         for index = 1, 5 do
             local questCard = scrollingFrame:FindFirstChild("QuestFrame" .. tostring(index))
-            if questCard then
-                local values = {}
-                local function readText(item)
-                    if not (item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox")) then return end
-                    local current = item
-                    while current and current ~= questCard do
-                        if current:IsA("GuiObject") and not current.Visible then return end
-                        current = current.Parent
-                    end
-                    if current ~= questCard then return end
-                    local value = tostring(item.Text or ""):gsub("^%s*(.-)%s*$", "%1")
-                    if value == "" or #value > 180 or seen[value] then return end
-                    seen[value] = true
-                    values[#values + 1] = value
-                    inspected += 1
+            if questCard and questCard:IsA("GuiObject") and questCard.Visible then
+                local title = getVisibleText(questCard, "TitleTextLabel")
+                local description = getVisibleText(questCard, "InfoTextLabel")
+                local progress = ""
+                local progressFrame = questCard:FindFirstChild("ProgressBarFrame", true)
+                if progressFrame then
+                    progress = getVisibleText(progressFrame, "TextLabel")
+                end
+                local reward = ""
+                local claimFrame = questCard:FindFirstChild("ClaimFrame", true)
+                if claimFrame then
+                    reward = getVisibleText(claimFrame, "TitleTextLabel")
                 end
 
-                if questCard:IsA("TextLabel") or questCard:IsA("TextButton") or questCard:IsA("TextBox") then
-                    readText(questCard)
-                end
-                for _, item in ipairs(questCard:GetDescendants()) do readText(item) end
-                if #values > 0 then
-                    results[#results + 1] = "Quest " .. tostring(index) .. ": " .. table.concat(values, " | ")
+                if title ~= "" then
+                    inspected += 1
+                    local entry = "Quest " .. tostring(index) .. ": " .. title
+                    if description ~= "" then entry = entry .. " | " .. description end
+                    if progress ~= "" then entry = entry .. " | Progress: " .. progress end
+                    if reward ~= "" then entry = entry .. " | Reward: " .. reward end
+                    results[#results + 1] = entry
                 end
             end
         end
-        return results, tostring(inspected) .. " visible text elements"
+        return results, tostring(inspected) .. " quest cards read"
     end
 
     local function scanQuestUI()
