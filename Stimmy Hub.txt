@@ -5725,7 +5725,7 @@ MovementTab:Toggle({
     Callback = function(v) Config.WaterWalkEnabled = v == true end,
 })
 
-(function()
+;(function()
     local waterWalkActive = false
     RunService.Stepped:Connect(function()
         if Config.WaterWalkEnabled then
