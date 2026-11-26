@@ -963,6 +963,9 @@ local function foodTerrainLoop(force, info)
                 if not arrived then
                     skip[curKey] = tick() + 120
                 else
+                    -- Keep the real arrival height if a tree or terrain pushed the character down.
+                    local arrivedRoot = getRoot()
+                    if arrivedRoot then target = arrivedRoot.Position end
                     startHold(target)
                     local t = tick()
                     while active() and tick() - t < Config.PromptWait and not promptOn("Food", true) do
@@ -5025,6 +5028,87 @@ task.spawn(function()
         end
     end
 end)
+end)()
+
+-- ================= AUTO QUEST TRACKER =================
+;(function()
+    Tab:Section({ Title = "Auto Quest" })
+
+    local QuestWeeklyLabel = Tab:Paragraph({ Title = "Weeklys\nNot scanned yet." })
+    local QuestDailyLabel = Tab:Paragraph({ Title = "Dailys\nNot scanned yet." })
+    local QuestScanStatus = Tab:Paragraph({ Title = "Quest UI Scan\nPress Scan Quest UI to inspect the visible quest interface." })
+
+    local function refreshQuestLabels(weekly, daily, status)
+        pcall(function() QuestWeeklyLabel:SetTitle("Weeklys\n" .. (#weekly > 0 and table.concat(weekly, "\n") or "No weekly quests detected.")) end)
+        pcall(function() QuestDailyLabel:SetTitle("Dailys\n" .. (#daily > 0 and table.concat(daily, "\n") or "No daily quests detected.")) end)
+        pcall(function() QuestScanStatus:SetTitle("Quest UI Scan\n" .. status) end)
+    end
+
+    local function scanQuestUI()
+        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if not playerGui then
+            refreshQuestLabels({}, {}, "PlayerGui was not found.")
+            return
+        end
+
+        local weekly, daily, seen = {}, {}, {}
+        local inspected = 0
+        local function visibleText(item)
+            if not (item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox")) then return nil end
+            local current = item
+            while current and current ~= playerGui do
+                if current:IsA("GuiObject") and not current.Visible then return nil end
+                current = current.Parent
+            end
+            local value = tostring(item.Text or ""):gsub("^%s*(.-)%s*$", "%1")
+            if value == "" or #value > 180 then return nil end
+            return value
+        end
+
+        for _, item in ipairs(playerGui:GetDescendants()) do
+            local value = visibleText(item)
+            if value then
+                inspected += 1
+                local category, ancestor = nil, item
+                for _ = 1, 10 do
+                    if not ancestor or ancestor == playerGui then break end
+                    local key = (ancestor.Name or ""):lower()
+                    local label = ""
+                    if ancestor:IsA("TextLabel") or ancestor:IsA("TextButton") then
+                        label = tostring(ancestor.Text or ""):lower()
+                    end
+                    local combined = key .. " " .. label
+                    if combined:find("weekly", 1, true) then category = "weekly" break end
+                    if combined:find("daily", 1, true) then category = "daily" break end
+                    ancestor = ancestor.Parent
+                end
+                local lower = value:lower()
+                local isHeading = lower == "weekly" or lower == "weeklys" or lower == "weekly quests"
+                    or lower == "daily" or lower == "dailys" or lower == "daily quests"
+                if category and not isHeading and not seen[category .. "|" .. value] then
+                    seen[category .. "|" .. value] = true
+                    local list = category == "weekly" and weekly or daily
+                    list[#list + 1] = value
+                end
+            end
+        end
+
+        table.sort(weekly)
+        table.sort(daily)
+        refreshQuestLabels(weekly, daily,
+            "Scanned " .. tostring(inspected) .. " visible text elements. Found "
+            .. tostring(#weekly) .. " weekly and " .. tostring(#daily) .. " daily entries.")
+    end
+
+    Tab:Button({
+        Title = "Scan Quest UI",
+        Callback = function()
+            local ok, err = pcall(scanQuestUI)
+            if not ok then
+                refreshQuestLabels({}, {}, "Scan failed: " .. tostring(err))
+            end
+        end,
+    })
 end)()
 
 Tab:Section({ Title = "Auto Spawn" })
