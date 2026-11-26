@@ -5036,7 +5036,7 @@ end)()
 
     local QuestWeeklyLabel = Tab:Paragraph({ Title = "Weeklys\nNot scanned yet." })
     local QuestDailyLabel = Tab:Paragraph({ Title = "Dailys\nNot scanned yet." })
-    local QuestScanStatus = Tab:Paragraph({ Title = "Quest UI Scan\nPress Scan Quest UI to inspect QuestsScreenGui.Frame." })
+    local QuestScanStatus = Tab:Paragraph({ Title = "Quest UI Scan\nPress Scan Quest UI to inspect both quest tabs." })
     local QuestCopyText = "Weekly Quests:\\nNot scanned yet.\\n\\nDaily Quests:\\nNot scanned yet."
 
     local function refreshQuestLabels(weekly, daily, status)
@@ -5045,84 +5045,129 @@ end)()
         pcall(function() QuestScanStatus:SetTitle("Quest UI Scan\n" .. status) end)
     end
 
+    local function getButtonStyle(button)
+        if not button then return "" end
+        local parts = {}
+        local function addObject(item)
+            if item:IsA("GuiObject") then
+                parts[#parts + 1] = table.concat({
+                    item.Name, tostring(item.Visible), tostring(item.BackgroundColor3),
+                    tostring(item.BackgroundTransparency), tostring(item.Size),
+                    tostring(item.Position)
+                }, ":")
+            end
+            if item:IsA("TextButton") or item:IsA("TextLabel") or item:IsA("TextBox") then
+                parts[#parts + 1] = table.concat({
+                    tostring(item.Text), tostring(item.TextColor3), tostring(item.TextTransparency),
+                    tostring(item.Font), tostring(item.TextSize)
+                }, ":")
+            elseif item:IsA("UIStroke") then
+                parts[#parts + 1] = tostring(item.Color) .. ":" .. tostring(item.Transparency)
+            end
+        end
+        addObject(button)
+        for _, item in ipairs(button:GetDescendants()) do addObject(item) end
+        return table.concat(parts, "|")
+    end
+
+    local function scanQuestTab(button, scrollingFrame)
+        if not button or not button:IsA("GuiButton") then
+            return {}, "tab button was not found"
+        end
+        local activated, activateError = pcall(function() button:Activate() end)
+        if not activated then return {}, "couldn't open tab: " .. tostring(activateError) end
+        task.wait(0.35)
+
+        if not scrollingFrame or not scrollingFrame.Parent then
+            return {}, "RefScrollingFrame was not found"
+        end
+
+        local results, seen = {}, {}
+        local inspected = 0
+        for index = 1, 5 do
+            local questCard = scrollingFrame:FindFirstChild("QuestFrame" .. tostring(index))
+            if questCard then
+                local values = {}
+                local function readText(item)
+                    if not (item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox")) then return end
+                    local current = item
+                    while current and current ~= questCard do
+                        if current:IsA("GuiObject") and not current.Visible then return end
+                        current = current.Parent
+                    end
+                    if current ~= questCard then return end
+                    local value = tostring(item.Text or ""):gsub("^%s*(.-)%s*$", "%1")
+                    if value == "" or #value > 180 or seen[value] then return end
+                    seen[value] = true
+                    values[#values + 1] = value
+                    inspected += 1
+                end
+
+                if questCard:IsA("TextLabel") or questCard:IsA("TextButton") or questCard:IsA("TextBox") then
+                    readText(questCard)
+                end
+                for _, item in ipairs(questCard:GetDescendants()) do readText(item) end
+                if #values > 0 then
+                    results[#results + 1] = "Quest " .. tostring(index) .. ": " .. table.concat(values, " | ")
+                end
+            end
+        end
+        return results, tostring(inspected) .. " visible text elements"
+    end
+
     local function scanQuestUI()
         local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-        if not playerGui then
-            refreshQuestLabels({}, {}, "PlayerGui was not found.")
+        local questsGui = playerGui and playerGui:FindFirstChild("QuestsScreenGui")
+        local questFrame = questsGui and questsGui:FindFirstChild("Frame")
+        local topButtons = questFrame and questFrame:FindFirstChild("TopButtonsFrame")
+        local weeklyButton = topButtons and topButtons:FindFirstChild("WeeklyButton")
+        local dailyButton = topButtons and topButtons:FindFirstChild("DailyButton")
+        local scrollingFrame = questFrame and questFrame:FindFirstChild("RefScrollingFrame")
+
+        if not playerGui then refreshQuestLabels({}, {}, "PlayerGui was not found.") return end
+        if not questsGui then refreshQuestLabels({}, {}, "QuestsScreenGui was not found.") return end
+        if not questFrame then refreshQuestLabels({}, {}, "QuestsScreenGui.Frame was not found.") return end
+        if not topButtons then refreshQuestLabels({}, {}, "TopButtonsFrame was not found.") return end
+        if not weeklyButton or not dailyButton then
+            refreshQuestLabels({}, {}, "WeeklyButton or DailyButton was not found.")
+            return
+        end
+        if not scrollingFrame then
+            refreshQuestLabels({}, {}, "RefScrollingFrame was not found.")
             return
         end
 
-        local questsGui = playerGui:FindFirstChild("QuestsScreenGui")
-        if not questsGui then
-            refreshQuestLabels({}, {}, "QuestsScreenGui was not found.")
-            return
+        local originalDailyStyle = getButtonStyle(dailyButton)
+        local originalWeeklyStyle = getButtonStyle(weeklyButton)
+        local dailyAttr = dailyButton:GetAttribute("Selected")
+        local weeklyAttr = weeklyButton:GetAttribute("Selected")
+        local originalTab = (dailyAttr == true and "daily") or (weeklyAttr == true and "weekly") or nil
+
+        local daily, dailyInfo = scanQuestTab(dailyButton, scrollingFrame)
+        if not originalTab then
+            originalTab = getButtonStyle(dailyButton) == originalDailyStyle and "daily"
+                or (getButtonStyle(weeklyButton) == originalWeeklyStyle and "weekly" or "daily")
         end
 
-        local questFrame = questsGui:FindFirstChild("Frame")
-        if not questFrame then
-            refreshQuestLabels({}, {}, "QuestsScreenGui.Frame was not found.")
-            return
-        end
+        local weekly, weeklyInfo = scanQuestTab(weeklyButton, scrollingFrame)
 
-        local weekly, daily, seen = {}, {}, {}
-        local inspected = 0
-        local function visibleText(item)
-            if not (item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox")) then return nil end
-            local current = item
-            while current and current ~= questFrame do
-                if current:IsA("GuiObject") and not current.Visible then return nil end
-                current = current.Parent
-            end
-            if current ~= questFrame then return nil end
-            local value = tostring(item.Text or ""):gsub("^%s*(.-)%s*$", "%1")
-            if value == "" or #value > 180 then return nil end
-            return value
-        end
+        local restoreButton = originalTab == "weekly" and weeklyButton or dailyButton
+        pcall(function() restoreButton:Activate() end)
 
-        for _, item in ipairs(questFrame:GetDescendants()) do
-            local value = visibleText(item)
-            if value then
-                inspected += 1
-                local category, ancestor = nil, item
-                for _ = 1, 10 do
-                    if not ancestor or ancestor == questFrame then break end
-                    local key = (ancestor.Name or ""):lower()
-                    local label = ""
-                    if ancestor:IsA("TextLabel") or ancestor:IsA("TextButton") then
-                        label = tostring(ancestor.Text or ""):lower()
-                    end
-                    local combined = key .. " " .. label
-                    if combined:find("weekly", 1, true) then category = "weekly" break end
-                    if combined:find("daily", 1, true) then category = "daily" break end
-                    ancestor = ancestor.Parent
-                end
-                local lower = value:lower()
-                local isHeading = lower == "weekly" or lower == "weeklys" or lower == "weekly quests"
-                    or lower == "daily" or lower == "dailys" or lower == "daily quests"
-                if category and not isHeading and not seen[category .. "|" .. value] then
-                    seen[category .. "|" .. value] = true
-                    local list = category == "weekly" and weekly or daily
-                    list[#list + 1] = value
-                end
-            end
-        end
-
-        table.sort(weekly)
-        table.sort(daily)
         QuestCopyText = "Weekly Quests:\\n" .. (#weekly > 0 and table.concat(weekly, "\\n") or "No weekly quests detected.")
             .. "\\n\\nDaily Quests:\\n" .. (#daily > 0 and table.concat(daily, "\\n") or "No daily quests detected.")
         refreshQuestLabels(weekly, daily,
-            "Scanned " .. tostring(inspected) .. " visible text elements inside QuestsScreenGui.Frame. Found "
-            .. tostring(#weekly) .. " weekly and " .. tostring(#daily) .. " daily entries.")
+            "Daily: " .. dailyInfo .. " (" .. tostring(#daily) .. " quest cards). Weekly: "
+            .. weeklyInfo .. " (" .. tostring(#weekly) .. " quest cards). Restored the " .. originalTab .. " tab.")
     end
 
     Tab:Button({
         Title = "Scan Quest UI",
         Callback = function()
-            local ok, err = pcall(scanQuestUI)
-            if not ok then
-                refreshQuestLabels({}, {}, "Scan failed: " .. tostring(err))
-            end
+            task.spawn(function()
+                local ok, err = pcall(scanQuestUI)
+                if not ok then refreshQuestLabels({}, {}, "Scan failed: " .. tostring(err)) end
+            end)
         end,
     })
 
