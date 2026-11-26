@@ -5238,6 +5238,7 @@ task.spawn(function()
 end)
 
 -- ================= TAB: MISC =================
+do -- Keep Misc controls scoped to avoid Luau's 200-local register limit.
 local MiscTab = Window:Tab({ Title = "Misc", Icon = "package" })
 hook(MiscTab)
 
@@ -5301,6 +5302,8 @@ MiscTab:Button({
         end
     end,
 })
+
+end -- Misc tab scope
 
 -- ================= TAB: FPS =================
 local toggleWindow
