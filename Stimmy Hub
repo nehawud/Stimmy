@@ -4689,6 +4689,7 @@ local AutoGrow = {
     current = nil,
     busy = false,
     tracker = {},
+    completions = 0,
     pausedEat = false,
     pausedDrink = false,
     lastGrowth = nil,
@@ -4891,12 +4892,14 @@ local GrowthTrackerLabel = Tab:Paragraph({ Title = "Growth Tracker\nNo animals t
 local function refreshGrowthTracker()
     local lines = {}
     for _, entry in ipairs(AutoGrow.tracker) do lines[#lines + 1] = entry end
-    local content = #lines > 0 and table.concat(lines, "\n") or "No animals tracked."
-    pcall(function() GrowthTrackerLabel:SetTitle("Growth Tracker\n" .. content) end)
+    local content = #lines > 0 and table.concat(lines, "\n") or "Waiting for next animal..."
+    local title = "Growth Tracker | x" .. tostring(AutoGrow.completions) .. " completions\n" .. content
+    pcall(function() GrowthTrackerLabel:SetTitle(title) end)
 end
 
 Tab:Button({ Title = "Clear Growth Tracker", Callback = function()
     AutoGrow.tracker = {}
+    AutoGrow.completions = 0
     AutoGrow.trackerIndex = nil
     AutoGrow.trackerActiveName = nil
     refreshGrowthTracker()
@@ -4929,8 +4932,10 @@ local function spawnNextGrowthAnimal()
     end
     AutoGrow.busy = true
     AutoGrow.current = AutoGrow.queue[1]
+    AutoGrow.tracker = AutoGrow.current and { "Loading " .. tostring(AutoGrow.current.display or AutoGrow.current.name) .. "..." } or {}
     AutoGrow.trackerIndex = nil
     AutoGrow.trackerActiveName = AutoGrow.current and AutoGrow.current.name or nil
+    refreshGrowthTracker()
     pauseEatDrinkForGrowth()
     task.spawn(function()
         local target = AutoGrow.current
@@ -5071,12 +5076,9 @@ task.spawn(function()
                     AutoGrow.trackerIndex = nil
                 end
                 if percent >= 100 then
-                    local line = trackerName .. " | Growth: Complete"
-                    if AutoGrow.trackerIndex and AutoGrow.tracker[AutoGrow.trackerIndex] then
-                        AutoGrow.tracker[AutoGrow.trackerIndex] = line
-                    else
-                        AutoGrow.tracker[#AutoGrow.tracker + 1] = line
-                    end
+                    -- Count the finished animal, then replace its tracker with the next one.
+                    AutoGrow.completions = AutoGrow.completions + 1
+                    AutoGrow.tracker = {}
                     AutoGrow.trackerIndex = nil
                     refreshGrowthTracker()
                     table.remove(AutoGrow.queue, 1)
@@ -5086,11 +5088,11 @@ task.spawn(function()
                     spawnNextGrowthAnimal()
                 else
                     local line = trackerName .. " | Growth: " .. tostring(percent) .. "% | Ongoing"
-                    if AutoGrow.trackerIndex and AutoGrow.tracker[AutoGrow.trackerIndex] then
-                        AutoGrow.tracker[AutoGrow.trackerIndex] = line
-                    else
-                        AutoGrow.tracker[#AutoGrow.tracker + 1] = line
-                        AutoGrow.trackerIndex = #AutoGrow.tracker
+                    -- Keep exactly one live tracker row; never append each new animal.
+                    AutoGrow.tracker[1] = line
+                    AutoGrow.trackerIndex = 1
+                    for index = #AutoGrow.tracker, 2, -1 do
+                        table.remove(AutoGrow.tracker, index)
                     end
                     refreshGrowthTracker()
                 end
