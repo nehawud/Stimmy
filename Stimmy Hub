@@ -5304,18 +5304,37 @@ MiscTab:Button({
 
         local moved = 0
         local failed = 0
-        for _, animalName in ipairs(selected) do
+        local movedNames = {}
+        local failedNames = {}
+
+        for index, animalName in ipairs(selected) do
+            notify("Move Slots", "Moving " .. animalName .. " (" .. tostring(index) .. "/" .. tostring(#selected) .. ") to slot " .. tostring(slot) .. "...")
+
             local ok, result = pcall(function()
                 return moveRemote:InvokeServer(animalName, slot)
             end)
+
             if ok and result ~= false then
                 moved = moved + 1
+                table.insert(movedNames, animalName)
             else
                 failed = failed + 1
+                table.insert(failedNames, animalName)
+            end
+
+            if index < #selected then
+                task.wait(0.75)
             end
         end
 
-        notify("Move Slots", "Moved: " .. tostring(moved) .. " | Failed: " .. tostring(failed) .. " | Destination: " .. tostring(slot))
+        local summary = "Moved: " .. table.concat(movedNames, ", ")
+        if #movedNames == 0 then
+            summary = "No animals moved."
+        end
+        if #failedNames > 0 then
+            summary = summary .. " | Failed: " .. table.concat(failedNames, ", ")
+        end
+        notify("Move Slots", summary .. " | Destination: " .. tostring(slot))
     end,
 })
 
