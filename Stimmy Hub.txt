@@ -5235,6 +5235,7 @@ end)()
     end
 
     local function moveQuestCircle(kind)
+        if not waitForNeeds() then return end
         local root = getRoot()
         if not root then return end
         local center, radius, count, standOff
@@ -5291,11 +5292,11 @@ end)()
 
     task.spawn(function()
         while alive do
-            task.wait(15)
             local ok, result = pcall(scanQuestUI)
             if not ok then
                 warn("[Auto Quest] Update failed: " .. tostring(result))
             end
+            task.wait(15)
         end
     end)
 
