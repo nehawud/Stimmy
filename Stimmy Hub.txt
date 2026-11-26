@@ -5220,14 +5220,19 @@ end)()
     local function waitForNeeds()
         if not needsRefill() then return true end
         releaseQuestMovement()
-        while alive and AutoQuest.on and not allEnabledNeedsFull() do task.wait(0.35) end
-        while alive and AutoQuest.on and State.Busy do task.wait(0.15) end
-        if not alive or not AutoQuest.on then return false end
-        if needsRefill() then return false end
-        State.Busy, State.Cancel, State.InCycle = true, false, true
-        State.CurrentKind, State.Searching = "Quest", true
-        refreshNoclip()
-        return true
+
+        -- Let the normal Eat/Drink scheduler own movement until both enabled
+        -- needs are above the refill threshold and its cycle has fully ended.
+        while alive and AutoQuest.on do
+            if not State.Busy and not needsRefill() then
+                State.Busy, State.Cancel, State.InCycle = true, false, true
+                State.CurrentKind, State.Searching = "Quest", true
+                refreshNoclip()
+                return true
+            end
+            task.wait(0.25)
+        end
+        return false
     end
 
     local function questStandOff(root)
