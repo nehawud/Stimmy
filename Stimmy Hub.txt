@@ -5145,8 +5145,7 @@ end)()
 
         local daily, dailyInfo = scanQuestTab(dailyButton, scrollingFrame)
         if not originalTab then
-            originalTab = getButtonStyle(dailyButton) == originalDailyStyle and "daily"
-                or (getButtonStyle(weeklyButton) == originalWeeklyStyle and "weekly" or "daily")
+            originalTab = getButtonStyle(dailyButton) == originalDailyStyle and "daily" or "weekly"
         end
 
         local weekly, weeklyInfo = scanQuestTab(weeklyButton, scrollingFrame)
