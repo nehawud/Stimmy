@@ -4790,7 +4790,9 @@ local function refreshAutoGrowOptions()
     AutoGrowOptions, AutoGrowDisplayToName = {}, {}
     local displayByName = {}
     for _, savedName in ipairs(getSavedCharacterNames()) do
-        if not isSavedAnimalComplete(savedName) and not tostring(savedName):match("^#+$") then
+        -- Use the same saved-name source as Auto Spawn across different game UI layouts.
+        -- Do not hide animals when a variant does not expose growth data on its saved cards.
+        if not tostring(savedName):match("^#+$") then
             local species, growth = getSavedCardData(savedName)
             species = species or "Unknown"
             if growth ~= nil and growth <= 1 then growth = growth * 100 end
@@ -4848,7 +4850,22 @@ AutoGrowDropdown = Tab:Dropdown({
     end,
 })
 
--- Refresh only when the saved-character menu adds/removes a slot; no polling loop.
+-- Poll the same saved-character list used by Auto Spawn. Some game variants rebuild
+-- their saved-character UI without firing the menu descendant events.
+local lastAutoGrowNamesSignature = table.concat(getSavedCharacterNames(), "\n")
+task.spawn(function()
+    while alive do
+        task.wait(1)
+        local names = getSavedCharacterNames()
+        local signature = table.concat(names, "\n")
+        if signature ~= lastAutoGrowNamesSignature then
+            lastAutoGrowNamesSignature = signature
+            local ok, err = pcall(refreshAutoGrowOptions)
+            if not ok then warn("[Auto Grow] character list refresh error: " .. tostring(err)) end
+        end
+    end
+end)
+
 local autoGrowMenuConnections = {}
 local autoGrowRefreshQueued = false
 local function queueAutoGrowSlotRefresh()
@@ -5323,6 +5340,43 @@ local MoveSlotDropdown = MiscTab:Dropdown({
             addSelection(value)
         end
     end,
+})
+
+local function refreshMoveSlotAnimals()
+    local selectedNames = MoveSlotSelected
+    local names = getSavedCharacterNames()
+    local options, displayToName = {}, {}
+    for _, savedName in ipairs(names) do
+        local species = getMoveSlotSpecies(savedName)
+        local display = species .. " (" .. savedName .. ")"
+        options[#options + 1] = display
+        displayToName[display] = savedName
+    end
+
+    local selectedDisplays = {}
+    for _, savedName in ipairs(selectedNames) do
+        for display, mappedName in pairs(displayToName) do
+            if mappedName == savedName then
+                selectedDisplays[#selectedDisplays + 1] = display
+                break
+            end
+        end
+    end
+
+    MoveSlotNames = names
+    MoveSlotOptions = options
+    MoveSlotDisplayToName = displayToName
+    pcall(function()
+        MoveSlotDropdown:Refresh(MoveSlotOptions)
+        if #selectedDisplays > 0 then MoveSlotDropdown:Select(selectedDisplays) end
+    end)
+    MoveSlotSelected = selectedNames
+    notify("Move Slots", "Animal list refreshed (" .. tostring(#MoveSlotNames) .. " found).")
+end
+
+MiscTab:Button({
+    Title = "Refresh Animals",
+    Callback = refreshMoveSlotAnimals,
 })
 
 MiscTab:Input({
