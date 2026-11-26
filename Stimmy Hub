@@ -4790,9 +4790,7 @@ local function refreshAutoGrowOptions()
     AutoGrowOptions, AutoGrowDisplayToName = {}, {}
     local displayByName = {}
     for _, savedName in ipairs(getSavedCharacterNames()) do
-        -- Use the same saved-name source as Auto Spawn across different game UI layouts.
-        -- Do not hide animals when a variant does not expose growth data on its saved cards.
-        if not tostring(savedName):match("^#+$") then
+        if not isSavedAnimalComplete(savedName) and not tostring(savedName):match("^#+$") then
             local species, growth = getSavedCardData(savedName)
             species = species or "Unknown"
             if growth ~= nil and growth <= 1 then growth = growth * 100 end
@@ -4849,22 +4847,6 @@ AutoGrowDropdown = Tab:Dropdown({
         end
     end,
 })
-
--- Poll the same saved-character list used by Auto Spawn. Some game variants rebuild
--- their saved-character UI without firing the menu descendant events.
-local lastAutoGrowNamesSignature = table.concat(getSavedCharacterNames(), "\n")
-task.spawn(function()
-    while alive do
-        task.wait(1)
-        local names = getSavedCharacterNames()
-        local signature = table.concat(names, "\n")
-        if signature ~= lastAutoGrowNamesSignature then
-            lastAutoGrowNamesSignature = signature
-            local ok, err = pcall(refreshAutoGrowOptions)
-            if not ok then warn("[Auto Grow] character list refresh error: " .. tostring(err)) end
-        end
-    end
-end)
 
 local autoGrowMenuConnections = {}
 local autoGrowRefreshQueued = false
