@@ -5174,9 +5174,18 @@ end)()
     Tab:Button({
         Title = "Scan Quest UI",
         Callback = function()
+            notify("Auto Quest", "Quest scan started.")
             task.spawn(function()
                 local ok, err = pcall(scanQuestUI)
-                if not ok then refreshQuestLabels({}, {}, "Scan failed: " .. tostring(err)) end
+                if not ok then
+                    warn("[Auto Quest] Scan failed: " .. tostring(err))
+                    pcall(function()
+                        refreshQuestLabels({}, {}, "Scan failed: " .. tostring(err))
+                    end)
+                    notify("Auto Quest", "Scan failed: " .. tostring(err))
+                else
+                    notify("Auto Quest", "Scan finished. Check the Daily and Weekly results below.")
+                end
             end)
         end,
     })
