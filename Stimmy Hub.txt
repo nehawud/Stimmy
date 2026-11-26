@@ -5745,6 +5745,7 @@ MovementTab:Toggle({
 end)()
 
 -- Separate quick-bind overlay. It follows the main window's visibility.
+;(function()
 local function setupQuickBindOverlay()
     local TweenService = game:GetService("TweenService")
     local quickGui = Instance.new("ScreenGui")
@@ -5994,6 +5995,7 @@ local function setupQuickBindOverlay()
     end)
 end
 setupQuickBindOverlay()
+end)()
 
 SettingsTab:Section({ Title = "Movement" })
 
