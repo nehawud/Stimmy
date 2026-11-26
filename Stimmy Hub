@@ -5348,7 +5348,8 @@ MiscTab:Button({
 
         for index, animalName in ipairs(selected) do
             local species = getMoveSlotSpecies(animalName)
-            notify("Move Slots", "Moving " .. species .. " (" .. tostring(index) .. "/" .. tostring(#selected) .. ") to slot " .. tostring(slot) .. "...")
+            local displayName = species .. " (" .. animalName .. ")"
+            notify("Move Slots", "Moving " .. displayName .. " (" .. tostring(index) .. "/" .. tostring(#selected) .. ") to slot " .. tostring(slot) .. "...")
 
             local ok, result = pcall(function()
                 return moveRemote:InvokeServer(animalName, slot)
@@ -5356,10 +5357,10 @@ MiscTab:Button({
 
             if ok and result ~= false then
                 moved = moved + 1
-                table.insert(movedNames, species)
+                table.insert(movedNames, displayName)
             else
                 failed = failed + 1
-                table.insert(failedNames, species)
+                table.insert(failedNames, displayName)
             end
 
             if index < #selected then
