@@ -4678,66 +4678,70 @@ local function getSavedCharacterNames()
     return names
 end
 
--- ================= AUTO HUNGRY (Workspace NPCs) =================
+-- ================= AUTO HUNGRY (PLAYER TRAVEL) =================
 ;(function()
     Tab:Section({ Title = "Auto Hungry" })
 
-    local AutoHungry = { on = false, busy = false, selected = {}, options = {}, displayToModel = {}, refreshing = false }
+    local AutoHungry = {
+        on = false,
+        busy = false,
+        selected = {},
+        options = {},
+        displayToPlayer = {},
+        refreshing = false,
+        lastTargetUserId = nil,
+    }
     local AutoHungryDropdown
-    local NPC_ATTACK_RANGE = 30
-    local NPC_ATTACK_TIMEOUT = 60
-    local NPC_CARCASS_WAIT = 15
+    local PLAYER_CARCASS_WAIT = 15
 
-    local function isRealPlayerCharacter(model)
-        for _, player in ipairs(Players:GetPlayers()) do
-            if player.Character == model then return true end
-        end
-        return false
-    end
-
-    local function getWorkspaceNPCs()
-        local found = {}
-        for _, inst in ipairs(workspace:GetDescendants()) do
-            if inst:IsA("Model") and inst ~= LocalPlayer.Character and not isRealPlayerCharacter(inst) then
-                local hum = inst:FindFirstChildOfClass("Humanoid")
-                local root = inst:FindFirstChild("HumanoidRootPart")
-                if hum and root and hum.Health > 0 then
-                    local species = inst:GetAttribute("AnimalName")
-                        or inst:GetAttribute("Species")
-                        or inst:GetAttribute("CharacterName")
-                    local label = tostring(inst.Name)
-                    if type(species) == "string" and species ~= "" and species ~= label then
-                        label = label .. " | " .. species
-                    end
-                    found[#found + 1] = { model = inst, hum = hum, root = root, label = label }
-                end
+    local function getPlayerLabel(player)
+        local label = player.Name
+        local character = player.Character
+        if character then
+            local species = character:GetAttribute("AnimalName")
+                or character:GetAttribute("Species")
+                or character:GetAttribute("CharacterName")
+            if type(species) == "string" and species ~= "" and species ~= label then
+                label = label .. " | " .. species
             end
         end
-        table.sort(found, function(a, b) return a.label:lower() < b.label:lower() end)
-        return found
+        return label
     end
 
     local function refreshAutoHungry()
-        local selectedLabels = {}
-        for label, enabled in pairs(AutoHungry.selected) do
-            if enabled then selectedLabels[#selectedLabels + 1] = label end
+        local selectedIds = {}
+        for userId, enabled in pairs(AutoHungry.selected) do
+            if enabled then selectedIds[userId] = true end
         end
-        table.sort(selectedLabels)
 
-        local options, displayToModel, counts = {}, {}, {}
-        for _, npc in ipairs(getWorkspaceNPCs()) do
-            counts[npc.label] = (counts[npc.label] or 0) + 1
-            local label = npc.label
-            if counts[label] > 1 then label = label .. " (" .. tostring(counts[label]) .. ")" end
+        local players = {}
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                players[#players + 1] = player
+            end
+        end
+        table.sort(players, function(a, b)
+            return a.Name:lower() < b.Name:lower()
+        end)
+
+        local options, displayToPlayer = {}, {}
+        for _, player in ipairs(players) do
+            local label = getPlayerLabel(player)
+            if displayToPlayer[label] then
+                label = label .. " (@" .. player.Name .. ")"
+            end
             options[#options + 1] = label
-            displayToModel[label] = npc.model
+            displayToPlayer[label] = player
         end
 
         AutoHungry.options = options
-        AutoHungry.displayToModel = displayToModel
+        AutoHungry.displayToPlayer = displayToPlayer
+
         local validSelected = {}
-        for _, label in ipairs(selectedLabels) do
-            if displayToModel[label] then validSelected[label] = true end
+        for label, player in pairs(displayToPlayer) do
+            if selectedIds[player.UserId] then
+                validSelected[player.UserId] = true
+            end
         end
         AutoHungry.selected = validSelected
 
@@ -4746,8 +4750,14 @@ end
             pcall(function()
                 AutoHungryDropdown:Refresh(options)
                 local selected = {}
-                for label in pairs(validSelected) do selected[#selected + 1] = label end
-                if #selected > 0 then AutoHungryDropdown:Select(selected) end
+                for label, player in pairs(displayToPlayer) do
+                    if validSelected[player.UserId] then
+                        selected[#selected + 1] = label
+                    end
+                end
+                if #selected > 0 then
+                    AutoHungryDropdown:Select(selected)
+                end
             end)
             AutoHungry.refreshing = false
         end
@@ -4755,7 +4765,7 @@ end
 
     refreshAutoHungry()
     AutoHungryDropdown = Tab:Dropdown({
-        Title = "Bots to Hunt",
+        Title = "Players to Travel To",
         Values = AutoHungry.options,
         Value = {},
         Multi = true,
@@ -4765,52 +4775,60 @@ end
             if AutoHungry.refreshing or type(values) ~= "table" then return end
             local selected = {}
             for _, label in ipairs(values) do
-                if AutoHungry.displayToModel[label] then selected[label] = true end
+                local player = AutoHungry.displayToPlayer[label]
+                if player and player ~= LocalPlayer then
+                    selected[player.UserId] = true
+                end
             end
             AutoHungry.selected = selected
         end,
     })
 
     Tab:Button({
-        Title = "Refresh Bot List",
+        Title = "Refresh Player List",
         Callback = function()
             refreshAutoHungry()
-            notify("Auto Hungry", "Workspace bot list refreshed.")
+            notify("Auto Hungry", "Player list refreshed.")
         end,
     })
 
-    local function findSelectedNPC()
-        for label in pairs(AutoHungry.selected) do
-            local model = AutoHungry.displayToModel[label]
-            if model and model:IsDescendantOf(workspace) and not isRealPlayerCharacter(model) then
-                local hum = model:FindFirstChildOfClass("Humanoid")
-                local root = model:FindFirstChild("HumanoidRootPart")
-                if hum and root and hum.Health > 0 then
-                    return label, model, hum, root
+    local function findSelectedPlayer()
+        local selected = {}
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and AutoHungry.selected[player.UserId] then
+                selected[#selected + 1] = player
+            end
+        end
+        table.sort(selected, function(a, b)
+            return a.Name:lower() < b.Name:lower()
+        end)
+        if #selected == 0 then return nil end
+
+        local startIndex = 1
+        if AutoHungry.lastTargetUserId then
+            for index, player in ipairs(selected) do
+                if player.UserId == AutoHungry.lastTargetUserId then
+                    startIndex = (index % #selected) + 1
+                    break
                 end
+            end
+        end
+
+        for offset = 0, #selected - 1 do
+            local player = selected[((startIndex + offset - 1) % #selected) + 1]
+            local character = player.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            if player.Parent == Players and character and humanoid and root and humanoid.Health > 0 then
+                AutoHungry.lastTargetUserId = player.UserId
+                return player, character, root
             end
         end
         return nil
     end
 
-    local function attackNPC(humanoid)
-        local remote = RS:FindFirstChild("AttackHandlerRemoteEvent")
-            or RS:WaitForChild("AttackHandlerRemoteEvent", 5)
-        if not remote or not remote:IsA("RemoteEvent") then return false end
-
-        local deadline = tick() + NPC_ATTACK_TIMEOUT
-        while alive and AutoHungry.on and humanoid.Parent and humanoid.Health > 0 and tick() < deadline do
-            -- Re-check that the NPC is not a real player's character before each attack.
-            local model = humanoid:FindFirstAncestorOfClass("Model")
-            if not model or isRealPlayerCharacter(model) then return false end
-            pcall(function() remote:FireServer(humanoid) end)
-            task.wait(0.5)
-        end
-        return humanoid.Health <= 0
-    end
-
     local function waitForNearbyCarcass(position)
-        local deadline = tick() + NPC_CARCASS_WAIT
+        local deadline = tick() + PLAYER_CARCASS_WAIT
         while alive and AutoHungry.on and tick() < deadline do
             for _, item in ipairs(findCarcassesAcrossMap()) do
                 if item.inst and item.inst:IsDescendantOf(workspace)
@@ -4833,23 +4851,28 @@ end
                 task.spawn(function()
                     while alive and AutoHungry.on do
                         if not AutoHungry.busy and (readStat("Food") or 100) < Config.RefillStart then
-                            local label, model, targetHumanoid, targetRoot = findSelectedNPC()
-                            if label and model and targetHumanoid and targetRoot then
+                            local player, character, root = findSelectedPlayer()
+                            if player and character and root then
                                 AutoHungry.busy = true
-                                local targetPosition = targetRoot.Position
-                                setStatus("hunting " .. label)
-                                local arrived = moveTo(targetPosition + Vector3.new(0, Config.HeightOffset, 0))
-                                if arrived and AutoHungry.on and targetHumanoid.Health > 0 then
-                                    setStatus("attacking " .. label)
-                                    local defeated = attackNPC(targetHumanoid)
-                                    if defeated then
-                                        setStatus("waiting for " .. label .. " carcass")
+                                local label = getPlayerLabel(player)
+                                local targetPosition = root.Position
+                                setStatus("traveling to " .. label)
+
+                                local ok, err = pcall(function()
+                                    moveTo(targetPosition + Vector3.new(0, Config.HeightOffset, 0))
+                                    if AutoHungry.on then
+                                        setStatus("looking for nearby food")
                                         waitForNearbyCarcass(targetPosition)
                                         if AutoHungry.on and (readStat("Food") or 100) < Config.RefillTarget and not State.Busy then
                                             task.spawn(runCycle, "Food", true)
-                                            while alive and AutoHungry.on and State.Busy do task.wait(0.2) end
+                                            while alive and AutoHungry.on and State.Busy do
+                                                task.wait(0.2)
+                                            end
                                         end
                                     end
+                                end)
+                                if not ok then
+                                    warn("[Auto Hungry] Travel cycle failed: " .. tostring(err))
                                 end
                                 AutoHungry.busy = false
                             else
@@ -4878,7 +4901,7 @@ end
             task.wait(2)
             if AutoHungry.on then
                 local ok, err = pcall(refreshAutoHungry)
-                if not ok then warn("[Auto Hungry] Bot list refresh failed: " .. tostring(err)) end
+                if not ok then warn("[Auto Hungry] Player list refresh failed: " .. tostring(err)) end
             end
         end
     end)
