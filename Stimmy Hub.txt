@@ -566,7 +566,7 @@ local function moveToShore(targetPos, ignoreCancel)
     local root = getRoot()
     if not root then return false end
     local started = tick()
-    local maxTime = (root.Position - targetPos).Magnitude / math.max(Config.TweenSpeed, 1) * 2 + 8
+    local maxTime = (root.Position - targetPos).Magnitude * 0.1 + 8
     while alive do
         if State.Cancel and not ignoreCancel then return false end
         root = getRoot()
