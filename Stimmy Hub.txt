@@ -49,6 +49,7 @@ local Config = {
     UrgentBelow = 50,    -- if the other enabled stat is below this, switch to it
     RefillTarget = 100,  -- keep going until this
     TweenSpeed = 80,     -- studs per second
+    TravelMethod = "Tween", -- "Tween" or short-step "Blink" movement
     HeightOffset = 3,    -- how far above the source to stand
     StandMode = "surface_up",
     NoTeleport = false,
@@ -63,19 +64,25 @@ local Config = {
     SearchDwell = 0.35,  -- pause at each search point (seconds)
     ProbeEat = true,     -- also fire the eat remote at each point and watch the food bar
     MainWaterOnly = true, -- drink only at the main water part (the big one under the map)
+    NoFallDamageEnabled = false,
+    AntiRagdollEnabled = false,
+    AntiRainEnabled = false,
+    WaterWalkEnabled = false,
+    FlyEnabled = false,
+    FlyMode = "CFrame",
+    FlySpeed = 10,
     WaterName = "",      -- blank = auto-pick the biggest water part; or type its name
     WaterMode = "Shoreline", -- "Shoreline" (terrain water, never underground) or "Parts" (old method)
     FaceWater = true,    -- turn to look at the water while drinking (the game cancels drinking otherwise)
     TiltToWater = false, -- also aim down at the water surface (off = only turn left/right)
     PlaneShoreOffset = 0.5, -- flat-water maps: studs to stand past the waterline (negative = on the land side)
-    WaterSearchDistance = 2000, -- how far across the map Auto Drink may look for water (studs)
 }
 
 local State = {
     Drinking = false, Eating = false,
     Busy = false, Cancel = false, InCycle = false,
     ReturnBack = true, NoclipMove = true, MovementNoclip = false,
-    Searching = false, ReturnFood = false, GoingHome = false,
+    Searching = false, ReturnFood = false, GoingHome = false, CurrentKind = nil,
 }
 
 local Spots = { Water = {}, Food = {} }                 -- learned spots {pos = Vector3}
@@ -120,17 +127,34 @@ local Status = "Idle"
 local function setStatus(s) Status = s end
 
 -- ================= REMOTES (separate) =================
+local foodRemoteActive = false
+local firing, firedAt = false, 0
 local function fireDrink() StateRemote:InvokeServer("Drinking") end
-local function fireEat()   StateRemote:InvokeServer("Eating") end
+local function fireEat()
+    foodRemoteActive = true
+    StateRemote:InvokeServer("Eating")
+end
+
+-- The game's Eating substate is toggled through the same remote. Only send
+-- the stop request if this script has actually started eating.
+local function stopFoodAction()
+    if foodRemoteActive then
+        -- Let any queued start request finish before sending the stop request.
+        local deadline = tick() + 2
+        while firing and tick() < deadline do task.wait(0.05) end
+        foodRemoteActive = false
+        pcall(function() StateRemote:InvokeServer("Eating") end)
+    end
+end
 
 local Kinds = {
     Water = { stat = "Water", flag = "Drinking", fire = fireDrink, prompt = "drink" },
     Food  = { stat = "Food",  flag = "Eating",   fire = fireEat,   prompt = "eat" },
 }
 
-local firing, firedAt = false, 0
 local function fireSafe(fn)
     if firing and tick() - firedAt < 3 then return end
+    if fn == fireEat then foodRemoteActive = true end
     firing, firedAt = true, tick()
     task.spawn(function()
         pcall(fn)
@@ -531,6 +555,39 @@ local function groundY(x, z, refY)
     return y
 end
 
+
+-- Shared travel method for shoreline/grass approach movement.
+local function moveToShore(targetPos, ignoreCancel)
+    if Config.TravelMethod ~= "Blink" then
+        return moveTo(targetPos, ignoreCancel)
+    end
+
+    -- Blink advances in short hops rather than making one long movement.
+    local root = getRoot()
+    if not root then return false end
+    local started = tick()
+    local maxTime = (root.Position - targetPos).Magnitude / math.max(Config.TweenSpeed, 1) * 2 + 8
+    while alive do
+        if State.Cancel and not ignoreCancel then return false end
+        root = getRoot()
+        if not root then return false end
+        local delta = targetPos - root.Position
+        local distance = delta.Magnitude
+        if distance < 0.5 then return true end
+        if tick() - started > maxTime then return false end
+        -- Move smoothly instead of teleporting the full 4-stud hop.
+        -- TweenSpeed controls travel speed, while 4 studs remains the
+        -- maximum distance covered in any single movement step.
+        local dt = RunService.Heartbeat:Wait()
+        local hop = math.min(distance, 4, math.max(Config.TweenSpeed, 1) * dt)
+        if hop > 0 then
+            root.CFrame = root.CFrame + delta.Unit * hop
+            root.AssemblyLinearVelocity = Vector3.zero
+        end
+    end
+    return false
+end
+
 -- lazy expanding-ring search: nearest spots first, then further out
 local function newGen(center, maxR)
     return { c = center, r = Config.SearchStep, i = 0, n = nil, maxR = maxR, k = 0 }
@@ -673,7 +730,7 @@ local function foodPromptLoop(force, info)
     while active() do
         local v = readStat("Food")
         if not v then leave() return "can't read food stat" end
-        if v >= Config.RefillTarget then leave() return "food full" end
+        if v >= Config.RefillTarget then stopFoodAction() leave() return "food full" end
         if not force and shouldYield("Food") then leave() return "paused food, water is low" end
         root = getRoot()
 
@@ -865,7 +922,7 @@ local function foodTerrainLoop(force, info)
     while active() do
         local v = readStat("Food")
         if not v then stopHold() return "can't read food stat", false end
-        if v >= Config.RefillTarget then stopHold() return "food full", false end
+        if v >= Config.RefillTarget then stopFoodAction() stopHold() return "food full", false end
         if not force and shouldYield("Food") then stopHold() return "paused food, water is low", false end
 
         if atSpot then
@@ -897,7 +954,7 @@ local function foodTerrainLoop(force, info)
                 setStatus(string.format("going to grass (%.0f studs)", (target - r.Position).Magnitude))
                 State.Searching = false
                 refreshNoclip()
-                local arrived = moveTo(target)
+                local arrived = moveToShore(target)
                 State.Searching = true
                 refreshNoclip()
                 if State.Cancel or not alive then stopHold() return "stopped", false end
@@ -995,7 +1052,8 @@ local function waterPlanes()
     pcall(function()
         for _, i in ipairs(CS:GetTagged("WaterPart")) do add(i) end
     end)
-    for _, i in ipairs(workspace:GetChildren()) do
+    -- Water parts are commonly nested under map folders/models.
+    for _, i in ipairs(workspace:GetDescendants()) do
         if i.Name:lower():find("water", 1, true) then add(i) end
     end
     return list
@@ -1006,12 +1064,16 @@ end
 local function findPlaneShore(from, skip)
     local planes = waterPlanes()
     if #planes == 0 then return nil end
-    local planeY, bestDy
+    local planeY, bestDy, bestPlane
     for _, p in ipairs(planes) do
         local top = p.Position.Y + p.Size.Y / 2
         local dy = math.abs(top - from.Y)
-        if not bestDy or dy < bestDy then planeY, bestDy = top, dy end
+        -- Ignore the giant fallback water plane when it is far below the playable map.
+        if dy <= 60 and (not bestDy or dy < bestDy) then
+            planeY, bestDy, bestPlane = top, dy, p
+        end
     end
+    if not planeY then return nil end
 
     -- rays ignore the water part and the moss/lily decoration so they reach the real ground
     local ignore = { LocalPlayer.Character }
@@ -1061,11 +1123,18 @@ local function findPlaneShore(from, skip)
         return e
     end
 
-    setStatus(string.format("scanning for the shoreline (flat water at Y=%.1f)...", planeY))
+    setStatus("locating the nearest usable shoreline...")
     local cgx, cgz = math.floor(from.X / S + 0.5), math.floor(from.Z / S + 0.5)
     local now = tick()
 
-    for r = 0, 40 do -- square rings outward, up to ~200 studs; stop at the first ring that has a usable shore
+    local maxRing = 40
+    -- Derive the limit from the selected water-part bounds instead of a fixed stud radius.
+    if bestPlane then
+        local centerDistance = (Vector3.new(bestPlane.Position.X, from.Y, bestPlane.Position.Z) - from).Magnitude
+        local halfDiagonal = math.sqrt(bestPlane.Size.X * bestPlane.Size.X + bestPlane.Size.Z * bestPlane.Size.Z) / 2
+        maxRing = math.max(maxRing, math.ceil((centerDistance + halfDiagonal + 64) / S))
+    end
+    for r = 0, maxRing do
         local bestD, bestGP, bestKey, bestFace
         for dx = -r, r do
             for dz = -r, r do
@@ -1122,12 +1191,13 @@ local function findPlaneShore(from, skip)
     return nil
 end
 
--- ---- whole-map fallback: no water within ~200 studs, so sample the map on a coarse grid, nearest first ----
--- Works for both kinds of water: a ray that lands on Water terrain counts as water, and so does ground
--- below a flat water part's surface. It only has to get you NEAR the shore; once you are there the
--- precise local search above takes over.
+-- ---- nearest-first shoreline fallback: expand outward only until a usable shore is found ----
+-- Terrain water is not represented by a normal BasePart, so probe the ground/water boundary
+-- around the player. The first ring with a valid shoreline is the closest candidate ring.
 local function findFarShore(from, skip)
-    local maxDist = Config.WaterSearchDistance
+    -- Expand outward from the player and stop at the first ring with a usable shore.
+    -- This is nearest-first; it does not enumerate the map's bounds or scan distant areas
+    -- after a closer shoreline has been found.
     local planes = waterPlanes()
     local planeY
     do
@@ -1135,7 +1205,10 @@ local function findFarShore(from, skip)
         for _, p in ipairs(planes) do
             local t = p.Position.Y + p.Size.Y / 2
             local dy = math.abs(t - from.Y)
-            if not bestDy or dy < bestDy then planeY, bestDy = t, dy end
+            -- MainWaterPart can be an underground safety plane, not drinkable surface water.
+            if dy <= 60 and (not bestDy or dy < bestDy) then
+                planeY, bestDy = t, dy
+            end
         end
     end
 
@@ -1198,13 +1271,13 @@ local function findFarShore(from, skip)
     end
 
     local cgx, cgz = math.floor(from.X / S + 0.5), math.floor(from.Z / S + 0.5)
-    local maxRing = math.ceil(maxDist / S)
     local now = tick()
+    local r = 0
 
-    for r = 0, maxRing do
-        if not alive or State.Cancel then return nil end
+    while alive and not State.Cancel do
         if r % 4 == 0 then
-            setStatus(string.format("searching the whole map for water (%d / %d studs out)...", r * S, maxDist))
+            setStatus("locating the nearest usable shoreline...")
+            task.wait()
         end
         local bestD, bestGP, bestKey, bestFace
         for dx = -r, r do
@@ -1262,6 +1335,7 @@ local function findFarShore(from, skip)
             end
         end
         if bestGP then return bestGP, bestKey, bestFace end
+        r += 1
     end
     return nil
 end
@@ -1269,7 +1343,7 @@ end
 -- nearest usable shore point to `from`: returns (groundPoint, key, pointToFace) or (nil, errorMessage)
 local function findShoreTarget(from, skip)
     for _, R in ipairs({ 48, 96, 160 }) do
-        setStatus(string.format("scanning terrain for water (%d studs)...", R))
+        setStatus("checking nearby shoreline candidates...")
         local ok, cells = pcall(scanWaterSurface, from, R)
         if not ok then
             warn("[AnimalFarm] water scan failed: " .. tostring(cells))
@@ -1290,10 +1364,10 @@ local function findShoreTarget(from, skip)
     -- no terrain water nearby: try games where the water is one big flat part (e.g. MainWaterPart)
     local pgp, pkey, pface = findPlaneShore(from, skip)
     if pgp then return pgp, pkey, pface end
-    -- nothing close by: look across the whole map and take the closest shore
+    -- nothing nearby: expand outward from the player and stop at the first usable shoreline
     local fgp, fkey, fface = findFarShore(from, skip)
     if fgp then return fgp, fkey, fface end
-    return nil, string.format("no water found within %d studs", Config.WaterSearchDistance)
+    return nil, "no usable water shoreline found"
 end
 
 local function waterShoreLoop(force, info)
@@ -1323,6 +1397,7 @@ local function waterShoreLoop(force, info)
     local skip, fails = {}, 0
     local best, lastProgress = 0, tick()
     local atSpot, curKey = false, nil
+    local currentTarget, currentCell
 
     while active() do
         local v = readStat("Water")
@@ -1331,12 +1406,76 @@ local function waterShoreLoop(force, info)
         if not force and shouldYield("Water") then stopHold() return "paused water, food is low" end
 
         if atSpot then
-            if v > best + 0.1 then best, lastProgress = v, tick() end
-            if tick() - lastProgress > Config.StallTime then
-                if curKey then skip[curKey] = tick() + 90 end
+            -- Rain can raise the shoreline water while the animal is drinking.
+            -- Detect swimming / water contact or the character being lifted above
+            -- the dry stand point, then retreat inland before selecting another shore.
+            local rootNow = getRoot()
+            local charNow = LocalPlayer.Character
+            local humNow = charNow and charNow:FindFirstChildOfClass("Humanoid")
+            local waterUnsafe = false
+            if humNow then
+                local humState = humNow:GetState()
+                waterUnsafe = humState == Enum.HumanoidStateType.Swimming
+                    or humNow.FloorMaterial == Enum.Material.Water
+            end
+            if rootNow and currentTarget and rootNow.Position.Y > currentTarget.Y + 2.25 then
+                waterUnsafe = true
+            end
+            if currentCell then
+                local waterParams = RaycastParams.new()
+                waterParams.FilterType = Enum.RaycastFilterType.Exclude
+                waterParams.FilterDescendantsInstances = { charNow }
+                waterParams.IgnoreWater = false
+                local waterRay = workspace:Raycast(
+                    Vector3.new(currentCell.X, currentCell.Y + 24, currentCell.Z),
+                    Vector3.new(0, -48, 0), waterParams
+                )
+                if waterRay and waterRay.Material == Enum.Material.Water
+                    and waterRay.Position.Y > currentCell.Y + 1.25 then
+                    waterUnsafe = true
+                end
+            end
+
+            if waterUnsafe and rootNow and currentTarget then
+                -- Keep this shoreline. Retreat inland in small steps, then keep
+                -- trying to drink; do not blacklist it or search for another one.
                 stopHold()
-                atSpot, curKey = false, nil
-            else
+                local away = currentCell and Vector3.new(
+                    currentTarget.X - currentCell.X, 0, currentTarget.Z - currentCell.Z
+                ) or Vector3.zero
+                if away.Magnitude < 0.1 then
+                    away = Vector3.new(-rootNow.CFrame.LookVector.X, 0, -rootNow.CFrame.LookVector.Z)
+                end
+                if away.Magnitude > 0.1 then
+                    local backup = currentTarget + away.Unit * 3
+                    local backupGround = groundY(backup.X, backup.Z, currentTarget.Y)
+                    if backupGround then
+                        backup = Vector3.new(backup.X, backupGround + standOff, backup.Z)
+                    end
+                    setStatus("water rising - backing up, then retrying this shoreline")
+                    State.Searching = false
+                    refreshNoclip()
+                    local backedUp = moveToShore(backup, true)
+                    State.Searching = true
+                    refreshNoclip()
+                    if backedUp then currentTarget = backup end
+                end
+                -- Preserve the current shore and keep the drinking loop
+                -- alive. If still unsafe, the next pass backs up another step.
+                local backupFace
+                if Config.FaceWater and currentCell then
+                    backupFace = Vector3.new(
+                        currentCell.X, Config.TiltToWater and currentCell.Y or currentTarget.Y, currentCell.Z
+                    )
+                end
+                startHold(currentTarget, backupFace)
+                best = readStat("Water") or best
+                lastProgress = tick()
+                task.wait(1)
+            elseif v > best + 0.1 then
+                best, lastProgress = v, tick()
+            end
+            if atSpot then
                 if canFire("Water") then fireSafe(info.fire) end
                 task.wait(Config.FireInterval)
             end
@@ -1357,7 +1496,7 @@ local function waterShoreLoop(force, info)
             setStatus(string.format("going to the shore (%.0f studs)", (target - r.Position).Magnitude))
             State.Searching = false
             refreshNoclip()
-            local arrived = moveTo(target)
+            local arrived = moveToShore(target)
             State.Searching = true
             refreshNoclip()
             if State.Cancel or not alive then stopHold() return "stopped" end
@@ -1371,6 +1510,7 @@ local function waterShoreLoop(force, info)
                     face = Vector3.new(cell.X, Config.TiltToWater and cell.Y or target.Y, cell.Z)
                 end
                 startHold(target, face)
+                currentTarget, currentCell = target, cell
                 LastWaterPos = target
                 -- the prompt text can linger, so the real check is: does the water bar rise here?
                 local base = readStat("Water") or v
@@ -1384,9 +1524,10 @@ local function waterShoreLoop(force, info)
                 if rose then
                     atSpot = true
                     best, lastProgress = readStat("Water") or v, tick()
-                    setStatus("drinking at the shore")
+                        setStatus("drinking at the shore")
                 else
                     stopHold()
+                    currentTarget, currentCell = nil, nil
                     skip[key] = tick() + 120
                     fails += 1
                     setStatus("can't drink here, trying another spot")
@@ -1460,10 +1601,153 @@ local function nearestGrassVector(from)
     return best
 end
 
+-- ================= DIET + CARCASS FOOD =================
+-- Diet is read from the active animal's attributes (the same attribute family used by ESP).
+local function getLocalDiet()
+    local char = LocalPlayer.Character
+    if not char then return "Herbivore" end
+    local textParts = { tostring(char:GetAttribute("AnimalName") or "") }
+    local function readAttributes(inst)
+        if not inst then return end
+        for key, value in pairs(inst:GetAttributes()) do
+            local k = tostring(key):lower()
+            if (k:find("diet", 1, true) or k:find("type", 1, true)
+                or k:find("food", 1, true) or k:find("class", 1, true)) and type(value) == "string" then
+                textParts[#textParts + 1] = value
+            end
+        end
+    end
+    readAttributes(char)
+    readAttributes(char:FindFirstChildOfClass("Humanoid"))
+    local dietText = table.concat(textParts, " "):lower()
+    if dietText:find("omnivore", 1, true) then return "Omnivore" end
+    if dietText:find("carnivore", 1, true) then return "Carnivore" end
+    if dietText:find("herbivore", 1, true) then return "Herbivore" end
+    -- Unknown diet safely defaults to the existing grass behavior.
+    return "Herbivore"
+end
+
+local function isCarcassModel(inst)
+    if not inst:IsA("Model") then return false end
+    local storage = workspace:FindFirstChild("CarcassesStorageModel")
+    if storage and inst == storage then return false end
+    if storage and inst.Parent == storage then return true end
+    if inst:GetAttribute("CarcassCreatedTime") ~= nil then return true end
+    local hum = inst:FindFirstChildOfClass("Humanoid")
+    if hum and hum:GetAttribute("IsDead") == true then return true end
+    local name = inst.Name:lower()
+    return name:find("carcass", 1, true) ~= nil or name:find("corpse", 1, true) ~= nil
+end
+
+local function findCarcassesAcrossMap()
+    local found, seen = {}, {}
+    local storage = workspace:FindFirstChild("CarcassesStorageModel")
+    for _, inst in ipairs(workspace:GetDescendants()) do
+        if isCarcassModel(inst) then
+            local hasCarcassAncestor = false
+            local ancestor = inst.Parent
+            while ancestor and ancestor ~= workspace do
+                if ancestor ~= storage and isCarcassModel(ancestor) then
+                    hasCarcassAncestor = true
+                    break
+                end
+                ancestor = ancestor.Parent
+            end
+            if not hasCarcassAncestor and not seen[inst] then
+                seen[inst] = true
+                local ok, cf = pcall(function() return inst:GetBoundingBox() end)
+                local pos = ok and cf.Position or inst:GetPivot().Position
+                found[#found + 1] = { inst = inst, pos = pos }
+            end
+        end
+    end
+    return found
+end
+
+local function foodCarcassLoop(force, info)
+    local function active()
+        return alive and not State.Cancel and (force or State[info.flag]) and getRoot() ~= nil
+    end
+    if promptState() == nil then
+        Cooldown.Food = tick() + 15
+        return "eat prompt GUI not found", false
+    end
+
+    State.Searching = true
+    refreshNoclip()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = getRoot()
+    if not root then return "character root not found", false end
+    local standOff = hum and (hum.HipHeight + root.Size.Y / 2) or Config.HeightOffset
+    local skipped = {}
+    local best, lastProgress = readStat("Food") or 0, tick()
+
+    while active() do
+        local food = readStat("Food")
+        if not food then stopHold() return "can't read food stat", false end
+        if food >= Config.RefillTarget then stopFoodAction() stopHold() return "food full", false end
+        if not force and shouldYield("Food") then stopHold() return "paused food, water is low", false end
+
+        local from = getRoot().Position
+        local carcasses = findCarcassesAcrossMap()
+        local target, targetDistance
+        for _, item in ipairs(carcasses) do
+            if item.inst:IsDescendantOf(workspace) and not skipped[item.inst] then
+                local distance = (item.pos - from).Magnitude
+                if not targetDistance or distance < targetDistance then
+                    target, targetDistance = item, distance
+                end
+            end
+        end
+        if not target then
+            Cooldown.Food = tick() + 15
+            stopHold()
+            return "no carcasses found in loaded map", false
+        end
+
+        local goal = target.pos + Vector3.new(0, standOff, 0)
+        setStatus(string.format("going to carcass (%.0f studs)", targetDistance))
+        stopHold()
+        State.Searching = false
+        refreshNoclip()
+        local arrived = moveTo(goal)
+        State.Searching = true
+        refreshNoclip()
+        if not active() then stopHold() return "stopped", false end
+
+        if arrived then
+            startHold(goal)
+            local promptDeadline = tick() + Config.PromptWait
+            while active() and tick() < promptDeadline and not promptOn("Food", true) do
+                task.wait(0.1)
+            end
+            if promptOn("Food", true) then
+                best, lastProgress = readStat("Food") or food, tick()
+                setStatus("eating carcass")
+                while active() do
+                    local current = readStat("Food") or best
+                    if current >= Config.RefillTarget then stopFoodAction() stopHold() return "food full", false end
+                    if current > best + 0.1 then best, lastProgress = current, tick() end
+                    if not promptOn("Food", false) or tick() - lastProgress > Config.StallTime then break end
+                    if canFire("Food") then fireSafe(info.fire) end
+                    task.wait(Config.FireInterval)
+                end
+            end
+        end
+        stopHold()
+        skipped[target.inst] = true
+        task.wait(0.1)
+    end
+    stopHold()
+    return "stopped", false
+end
+
 local function runCycle(kind, force)
     if State.Busy or State.GoingHome then return end
     local info = Kinds[kind]
     State.Busy, State.Cancel, State.InCycle = true, false, true
+    State.CurrentKind = kind
     refreshNoclip()
 
     local origin
@@ -1484,17 +1768,33 @@ local function runCycle(kind, force)
 
     local finalMsg
     local ok, err = pcall(function()
-        if kind == "Food" and Config.FoodMode == "Terrain Grass" then
-            local msg, fallback = foodTerrainLoop(force, info)
-            if not fallback then
-                finalMsg = msg
+        if kind == "Food" then
+            local diet = getLocalDiet()
+            if diet == "Carnivore" then
+                finalMsg = foodCarcassLoop(force, info)
+                return
+            elseif diet == "Omnivore" and Config.FoodMode == "Terrain Grass" then
+                -- Omnivores try grass first; carcasses are only a fallback.
+                local msg, fallback = foodTerrainLoop(force, info)
+                if not fallback and msg ~= "no working grass spot found" then
+                    finalMsg = msg
+                    return
+                end
+                setStatus("grass unavailable, searching for carcasses")
+                finalMsg = foodCarcassLoop(force, info)
+                return
+            elseif Config.FoodMode == "Terrain Grass" then
+                local msg, fallback = foodTerrainLoop(force, info)
+                if not fallback then
+                    finalMsg = msg
+                    return
+                end
+                setStatus(msg .. ", using prompt search")
+            end
+            if Config.FoodMode == "Prompt Search" or Config.FoodMode == "Terrain Grass" then
+                finalMsg = foodPromptLoop(force, info)
                 return
             end
-            setStatus(msg .. ", using prompt search")
-        end
-        if kind == "Food" and (Config.FoodMode == "Prompt Search" or Config.FoodMode == "Terrain Grass") then
-            finalMsg = foodPromptLoop(force, info)
-            return
         end
         if kind == "Water" and Config.WaterMode == "Shoreline" then
             finalMsg = waterShoreLoop(force, info)
@@ -1525,6 +1825,7 @@ local function runCycle(kind, force)
                 break
             end
             if v >= Config.RefillTarget then
+                if kind == "Food" then stopFoodAction() end
                 finalMsg = kind:lower() .. " full"
                 break
             end
@@ -1610,6 +1911,10 @@ local function runCycle(kind, force)
         end
     end)
 
+    if kind == "Food" and (not State.Eating or State.Cancel) then
+        stopFoodAction()
+    end
+
     if not ok then
         finalMsg = "error: " .. tostring(err)
         warn("[AnimalFarm] " .. tostring(err))
@@ -1618,7 +1923,8 @@ local function runCycle(kind, force)
     pcall(function()
         stopHold()
         local r = getRoot()
-        if kind == "Water" and (readStat("Water") or 0) >= Config.RefillTarget and r then
+        -- Do not start a return trip after the user manually cancels a refill.
+        if not State.Cancel and kind == "Water" and (readStat("Water") or 0) >= Config.RefillTarget and r then
             local grassTarget = nearestGrassVector(r.Position)
             if grassTarget then
                 setStatus("returning to nearest grass")
@@ -1632,7 +1938,7 @@ local function runCycle(kind, force)
                 setStatus("no known grass vector found")
             end
             WaterOrigin, LastWaterPos = nil, nil
-        elseif kind ~= "Water" and State.ReturnBack and origin and r and not (kind == "Food" and not State.ReturnFood) then
+        elseif not State.Cancel and kind ~= "Water" and State.ReturnBack and origin and r and not (kind == "Food" and not State.ReturnFood) then
             setStatus("returning")
             moveTo(origin.Position, true)
             r = getRoot()
@@ -1643,6 +1949,7 @@ local function runCycle(kind, force)
 
     stopHold()
     State.Busy, State.InCycle, State.Searching = false, false, false
+    State.CurrentKind, State.Cancel = nil, false
     refreshNoclip()
     setStatus(finalMsg or "idle")
 end
@@ -1716,7 +2023,30 @@ local FS_OK = type(writefile) == "function" and type(readfile) == "function" and
 local DIR = "StimmyHub"
 local Values, Elements = {}, {}
 local HitSafe, AuraSafe, refreshHitList, refreshAuraList
+local GroupAutoAddedOwnership = {}
 local applyConfigMinKey, applyConfigAuraKey
+local applyConfigQuickBind
+local requestQuickBindCapture, triggerMovementTeleport
+local waterWalkConnection, waterWalkOriginalCanCollide
+local QuickBindCodes = {
+    KillAura = Enum.KeyCode.T,
+    Hitbox = Enum.KeyCode.O,
+    AutoSpecial = Enum.KeyCode.I,
+    Walkspeed = Enum.KeyCode.G,
+    Fly = Enum.KeyCode.Y,
+    Noclip = Enum.KeyCode.V,
+    ESP = Enum.KeyCode.F1,
+    Teleport = Enum.KeyCode.B,
+}
+for bind, keyCode in pairs(QuickBindCodes) do
+    Values["QuickBind_" .. bind] = keyCode.Name
+end
+local setQuickOverlayVisible
+local applyQuickBindVisibility
+local QuickBindHidden = {}
+Values.QuickBindHidden = {}
+local QuickBindButtons = {}
+local QuickBindCapturing = false
 local ConfigReady = false
 local ConfigName, SelectedAutoConfig = "", ""
 local LoadedConfigName, AutoConfigName = "", ""
@@ -1780,8 +2110,40 @@ local function ensureDir()
     if makefolder and isfolder and not isfolder(DIR) then pcall(makefolder, DIR) end
 end
 
-local function notify(title, content)
-    pcall(function() WindUI:Notify({ Title = title, Content = content, Duration = 4 }) end)
+local replaceableNotice
+local predatorNotice
+local function notify(title, content, duration, onClose)
+    pcall(function()
+        local isPredatorNotice = title == "⚠️ Danger Alert ⚠️"
+        local replacePrevious = title == "Kill Aura Turned On"
+            or title == "Kill Aura Turned Off"
+            or isPredatorNotice
+        if replacePrevious and replaceableNotice and not replaceableNotice.Closed then
+            local previous = replaceableNotice
+            task.spawn(function()
+                pcall(function() previous:Close() end)
+            end)
+        end
+        local notice = WindUI:Notify({ Title = title, Content = content, Duration = duration or 4 })
+        if replacePrevious then replaceableNotice = notice end
+        if isPredatorNotice then predatorNotice = notice end
+        if onClose and notice and notice.UIElements then
+            local closeButton = notice.UIElements.CloseButton
+            if closeButton then
+                local handled = false
+                local function handleClose()
+                    if handled then return end
+                    handled = true
+                    pcall(onClose)
+                end
+                pcall(function() closeButton.MouseButton1Click:Connect(handleClose) end)
+                pcall(function()
+                    local childButton = closeButton:FindFirstChildOfClass("TextButton")
+                    if childButton then childButton.MouseButton1Click:Connect(handleClose) end
+                end)
+            end
+        end
+    end)
 end
 
 local function v3t(v) return v and { x = v.X, y = v.Y, z = v.Z } or nil end
@@ -1845,6 +2207,9 @@ local function loadConfig(name, silent)
             pcall(applyConfigMinKey, v)
         elseif flag == "KillAuraKey" and applyConfigAuraKey then
             pcall(applyConfigAuraKey, v)
+        elseif flag:match("^QuickBind_(.+)$") and applyConfigQuickBind then
+            local bind = flag:match("^QuickBind_(.+)$")
+            pcall(applyConfigQuickBind, bind, v)
         else
             local e = Elements[flag]
             if e then
@@ -1978,7 +2343,11 @@ local function saveServerSafeLists()
         table.sort(out, function(x, y) return x:lower() < y:lower() end)
         return out
     end
-    pcall(writefile, path, HttpService:JSONEncode({ Hitbox = names(HitSafe), KillAura = names(AuraSafe) }))
+    pcall(writefile, path, HttpService:JSONEncode({
+        Hitbox = names(HitSafe),
+        KillAura = names(AuraSafe),
+        GroupAutoAdded = GroupAutoAddedOwnership,
+    }))
 end
 
 local function loadServerSafeLists()
@@ -1998,6 +2367,17 @@ local function loadServerSafeLists()
         end
     end
     restore(HitSafe, data.Hitbox); restore(AuraSafe, data.KillAura)
+    if type(data.GroupAutoAdded) == "table" then
+        for name, owned in pairs(data.GroupAutoAdded) do
+            if type(name) == "string" and type(owned) == "table"
+                and Players:FindFirstChild(name) then
+                GroupAutoAddedOwnership[name] = {
+                    Hitbox = owned.Hitbox == true and HitSafe[name] == true,
+                    KillAura = owned.KillAura == true and AuraSafe[name] == true,
+                }
+            end
+        end
+    end
     if refreshHitList then pcall(refreshHitList) end
     if refreshAuraList then pcall(refreshAuraList) end
 end
@@ -2055,6 +2435,54 @@ do
         end,
     })
 
+    do
+        local function installNoFallDamageHook()
+            if env.StimmyHubNoFallDamageHookInstalled then return true end
+            if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function"
+                or type(checkcaller) ~= "function" then return false end
+
+            local oldNamecall
+            local namecallHandler = function(self, ...)
+                if not checkcaller() and env.StimmyHubNoFallDamageEnabled then
+                    local method = getnamecallmethod()
+                    if method == "FireServer" and self.Name == "PlayerDamageSelfRemoteEvent" then
+                        return nil
+                    end
+                end
+                return oldNamecall(self, ...)
+            end
+            local hookClosure = type(newcclosure) == "function" and newcclosure(namecallHandler) or namecallHandler
+            local ok, previous = pcall(hookmetamethod, game, "__namecall", hookClosure)
+            if not ok or type(previous) ~= "function" then return false end
+            oldNamecall = previous
+            env.StimmyHubNoFallDamageHookInstalled = true
+            return true
+        end
+
+        local NoFallToggle
+        NoFallToggle = CombatTab:Toggle({
+            Title = "No Fall Damage",
+            Value = false,
+            Flag = "NoFallDamageEnabled",
+            Callback = function(v)
+                if not v then
+                    Config.NoFallDamageEnabled = false
+                    env.StimmyHubNoFallDamageEnabled = false
+                    return
+                end
+                if not installNoFallDamageHook() then
+                    Config.NoFallDamageEnabled = false
+                    env.StimmyHubNoFallDamageEnabled = false
+                    notify("No Fall Damage", "This executor does not support the required namecall hook.")
+                    task.defer(function() pcall(function() NoFallToggle:Set(false) end) end)
+                    return
+                end
+                Config.NoFallDamageEnabled = true
+                env.StimmyHubNoFallDamageEnabled = true
+            end,
+        })
+    end
+
     -- ---------- shared: a searchable multi-select "safe" list of player names ----------
 
     local function newWhitelist(title, onAdded)
@@ -2062,6 +2490,7 @@ do
         local shown = {}
         local muteUntil = 0
         local dd
+        local lastSelectionKey = ""
 
         local function names()
             local rows, seen = {}, {}
@@ -2078,15 +2507,45 @@ do
             return rows
         end
 
-        local function refresh()
-            shown = names()
-            muteUntil = tick() + 0.5 -- ignore the callbacks our own Refresh / Select causes
-            pcall(function() dd:Refresh(shown, true) end)
-            local sel = {}
-            for _, n in ipairs(shown) do
-                if Safe[n] then sel[#sel + 1] = n end
+        local function selectionKey()
+            local selected = {}
+            for n, enabled in pairs(Safe) do
+                if enabled then selected[#selected + 1] = n end
             end
-            pcall(function() dd:Select(sel) end)
+            table.sort(selected)
+            return table.concat(selected, "\0")
+        end
+
+        local function sameNames(a, b)
+            if #a ~= #b then return false end
+            for i, n in ipairs(a) do
+                if b[i] ~= n then return false end
+            end
+            return true
+        end
+
+        local function refresh()
+            local freshNames = names()
+            local namesChanged = not sameNames(shown, freshNames)
+            local freshSelectionKey = selectionKey()
+            local selectionChanged = namesChanged or freshSelectionKey ~= lastSelectionKey
+
+            -- Avoid rebuilding the dropdown on whitelist-only changes. Rebuilding it
+            -- unnecessarily was clearing the user's active search text.
+            if namesChanged then
+                shown = freshNames
+                muteUntil = tick() + 0.35
+                pcall(function() dd:Refresh(shown, true) end)
+            end
+            if selectionChanged then
+                local sel = {}
+                for _, n in ipairs(shown) do
+                    if Safe[n] then sel[#sel + 1] = n end
+                end
+                lastSelectionKey = freshSelectionKey
+                muteUntil = tick() + 0.35
+                pcall(function() dd:Select(sel) end)
+            end
         end
 
         local function persist()
@@ -2125,6 +2584,7 @@ do
                     if onAdded then onAdded(opt) end
                 end
             end
+            lastSelectionKey = selectionKey()
             if changed then persist() end
         end
 
@@ -2143,17 +2603,50 @@ do
     end
 
     -- ---------- hitbox expander ----------
-    local Hit = { on = false, mult = 5 }
+    local Hit = { on = false, mult = 5, priorityClosest = true, preferredTarget = nil, targetScanAt = 0 }
     local Hitboxes, origGetDefs, origGetReach = nil, nil, nil
     local ScaledCache = setmetatable({}, { __mode = "k" }) -- [original definitions] = { mult, list }
 
     -- Hitbox and aura safe lists are declared above for additive sync.
 
     local function isHitSafe(char)
-        local pl = Players:GetPlayerFromCharacter(char)
-        return pl ~= nil and HitSafe[pl.Name] == true
+        local player = Players:GetPlayerFromCharacter(char)
+        return player ~= nil and HitSafe[player.Name] == true
     end
 
+    local function getPreferredHitTarget()
+        local now = tick()
+        if now - Hit.targetScanAt < 0.1 then return Hit.preferredTarget end
+        Hit.targetScanAt = now
+        local myCharacter = LocalPlayer.Character
+        local myRoot = myCharacter and myCharacter:FindFirstChild("HumanoidRootPart")
+        if not myRoot then
+            Hit.preferredTarget = nil
+            return nil
+        end
+
+        local closestCharacter, closestDistance
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and not HitSafe[player.Name] then
+                local character = player.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                local root = character and character:FindFirstChild("HumanoidRootPart")
+                if character and humanoid and humanoid.Health > 0 and root then
+                    local distance = (root.Position - myRoot.Position).Magnitude
+                    if not closestDistance or distance < closestDistance then
+                        closestCharacter, closestDistance = character, distance
+                    end
+                end
+            end
+        end
+        Hit.preferredTarget = closestCharacter
+        return closestCharacter
+    end
+
+    local function isPreferredHitTarget(char)
+        return Hit.on and char ~= LocalPlayer.Character and not isHitSafe(char)
+            and (not Hit.priorityClosest or getPreferredHitTarget() == char)
+    end
     local function getHitboxes()
         if Hitboxes then return Hitboxes end
         local ok, mod = pcall(function()
@@ -2198,8 +2691,7 @@ do
             end
             H.GetReach = function(char, ...)
                 local r = gr(char, ...)
-                if r and Hit.on and typeof(char) == "Instance"
-                    and char ~= LocalPlayer.Character and not isHitSafe(char) then
+                if r and isPreferredHitTarget(char) then
                     return r * Hit.mult
                 end
                 return r
@@ -2215,127 +2707,10 @@ do
             if origGetReach then pcall(function() H.GetReach = origGetReach end) end
         end
         origGetDefs, origGetReach = nil, nil
+        Hit.preferredTarget = nil
+        Hit.targetScanAt = 0
         ScaledCache = setmetatable({}, { __mode = "k" })
     end
-
-
-    CombatTab:Section({ Title = "Hitbox Expander" })
-
-    local HitToggle
-    HitToggle = CombatTab:Toggle({
-        Title = "Hitbox Expander",
-        Value = false,
-        Flag = "HitboxOn",
-        Callback = function(v)
-            if not v then
-                Hit.on = false
-                removeOverrides()
-                return
-            end
-            task.spawn(function()
-                if not getHitboxes() then
-                    notify("Hitbox expander", "Couldn't load the game's Hitboxes module (needs an executor with require).")
-                    pcall(function() HitToggle:Set(false) end)
-                    return
-                end
-                if not installOverrides() then
-                    notify("Hitbox expander", "The game's module is read-only here, can't enlarge hitboxes.")
-                    removeOverrides()
-                    pcall(function() HitToggle:Set(false) end)
-                    return
-                end
-                Hit.on = true
-            end)
-        end,
-    })
-
-    CombatTab:Slider({
-        Title = "Hitbox Size Multiplier",
-        Step = 1,
-        Value = { Min = 1, Max = 30, Default = Hit.mult },
-        Flag = "HitboxMult",
-        Callback = function(v) Hit.mult = math.clamp(v, 1, 30) end,
-    })
-
-    HitSafe, refreshHitList = newWhitelist("Hitbox Safe Whitelist", function(name)
-        if AuraSafe and not AuraSafe[name] then
-            AuraSafe[name] = true
-            if refreshAuraList then refreshAuraList() end
-        end
-    end)
-
-    -- ---------- kill aura: fully independent of the Hitbox Expander and the game's own reach check ----------
-    -- Picks a target itself (within a fixed range, by priority) and fires the attack remote directly,
-    -- the same remote the game's own attack sends (AttackHandlerRemoteEvent:FireServer(humanoid)).
-    -- No animation, no sound: just the server report, same as Auto Eat/Drink skip their animations.
-    local AURA_RANGE = 30 -- fixed, not adjustable
-    local Aura = { on = false, delay = 0.5 }
-    -- Aura safe list is created below Kill Aura Priority.
-    local AttackHandlerRemoteEvent
-
-    local function getAttackRemote()
-        if AttackHandlerRemoteEvent then return AttackHandlerRemoteEvent end
-        local ok, remote = pcall(function() return RS:WaitForChild("AttackHandlerRemoteEvent", 5) end)
-        if ok then AttackHandlerRemoteEvent = remote end
-        return AttackHandlerRemoteEvent
-    end
-
-    local PRIORITY_KEYS = { "Closest", "Lowest HP", "Highest HP" }
-    local Priority = { "Closest" } -- ordered, up to 2; first is primary sort, second breaks ties
-
-    local function keyValue(c, key)
-        if key == "Closest" then return c.dist end
-        if key == "Lowest HP" then return c.hp end
-        if key == "Highest HP" then return -c.hp end
-        return 0
-    end
-
-    local function pickAuraTarget()
-        local myRoot = getRoot()
-        if not myRoot then return nil end
-        local candidates = {}
-        for _, pl in ipairs(Players:GetPlayers()) do
-            if pl ~= LocalPlayer and not AuraSafe[pl.Name] then
-                local char = pl.Character
-                local root = char and char:FindFirstChild("HumanoidRootPart")
-                local hum = char and char:FindFirstChildOfClass("Humanoid")
-                if root and hum and hum.Health > 0 then
-                    local d = (root.Position - myRoot.Position).Magnitude
-                    if d <= AURA_RANGE then
-                        candidates[#candidates + 1] = { hum = hum, dist = d, hp = hum.Health }
-                    end
-                end
-            end
-        end
-        if #candidates == 0 then return nil end
-        table.sort(candidates, function(a, b)
-            for _, key in ipairs(Priority) do
-                local va, vb = keyValue(a, key), keyValue(b, key)
-                if va ~= vb then return va < vb end
-            end
-            return a.dist < b.dist
-        end)
-        return candidates[1].hum
-    end
-
-    local function auraStep()
-        local remote = getAttackRemote()
-        if not remote then return end
-        local hum = pickAuraTarget()
-        if hum then
-            remote:FireServer(hum)
-        end
-    end
-
-    task.spawn(function()
-        while alive do
-            task.wait(math.max(0.05, Aura.delay))
-            if Aura.on then
-                local ok, err = pcall(auraStep)
-                if not ok then warn("[AnimalFarm] kill aura error: " .. tostring(err)) end
-            end
-        end
-    end)
 
 
     CombatTab:Section({ Title = "Auto Special Attack" })
@@ -2485,6 +2860,147 @@ do
         Callback = function(v) AutoSpecial.distance = math.clamp(v, 1, 20) end,
     })
 
+
+    CombatTab:Section({ Title = "Hitbox Expander" })
+
+    local HitToggle
+    HitToggle = CombatTab:Toggle({
+        Title = "Hitbox Expander",
+        Value = false,
+        Flag = "HitboxOn",
+        Callback = function(v)
+            if not v then
+                Hit.on = false
+                removeOverrides()
+                return
+            end
+            task.spawn(function()
+                if not getHitboxes() then
+                    notify("Hitbox expander", "Couldn't load the game's Hitboxes module (needs an executor with require).")
+                    pcall(function() HitToggle:Set(false) end)
+                    return
+                end
+                if not installOverrides() then
+                    notify("Hitbox expander", "The game's module is read-only here, can't enlarge hitboxes.")
+                    removeOverrides()
+                    pcall(function() HitToggle:Set(false) end)
+                    return
+                end
+                Hit.on = true
+            end)
+        end,
+    })
+
+    CombatTab:Slider({
+        Title = "Hitbox Size Multiplier",
+        Step = 1,
+        Value = { Min = 1, Max = 30, Default = Hit.mult },
+        Flag = "HitboxMult",
+        Callback = function(v) Hit.mult = math.clamp(v, 1, 30) end,
+    })
+
+    CombatTab:Dropdown({
+        Title = "Hitbox Priority",
+        Values = { "Closest" },
+        Value = { "Closest" },
+        Multi = true,
+        AllowNone = true,
+        SearchBarEnabled = false,
+        Flag = "HitboxPriority",
+        Callback = function(options)
+            local closestSelected = false
+            if type(options) == "table" then
+                for _, option in pairs(options) do
+                    local name = type(option) == "table" and (option.Title or option.Name) or option
+                    if name == "Closest" then closestSelected = true break end
+                end
+            end
+            Hit.priorityClosest = closestSelected
+            Hit.preferredTarget = nil
+            Hit.targetScanAt = 0
+        end,
+    })
+    HitSafe, refreshHitList = newWhitelist("Hitbox Safe Whitelist", function(name)
+        if AuraSafe and not AuraSafe[name] then
+            AuraSafe[name] = true
+            if refreshAuraList then refreshAuraList() end
+        end
+    end)
+
+    -- ---------- kill aura: fully independent of the Hitbox Expander and the game's own reach check ----------
+    -- Picks a target itself (within a fixed range, by priority) and fires the attack remote directly,
+    -- the same remote the game's own attack sends (AttackHandlerRemoteEvent:FireServer(humanoid)).
+    -- No animation, no sound: just the server report, same as Auto Eat/Drink skip their animations.
+    local AURA_RANGE = 30 -- fixed, not adjustable
+    local Aura = { on = false, delay = 0.5 }
+    -- Aura safe list is created below Kill Aura Priority.
+    local AttackHandlerRemoteEvent
+
+    local function getAttackRemote()
+        if AttackHandlerRemoteEvent then return AttackHandlerRemoteEvent end
+        local ok, remote = pcall(function() return RS:WaitForChild("AttackHandlerRemoteEvent", 5) end)
+        if ok then AttackHandlerRemoteEvent = remote end
+        return AttackHandlerRemoteEvent
+    end
+
+    local PRIORITY_KEYS = { "Closest", "Lowest HP", "Highest HP" }
+    local Priority = { "Closest" } -- ordered, up to 2; first is primary sort, second breaks ties
+
+    local function keyValue(c, key)
+        if key == "Closest" then return c.dist end
+        if key == "Lowest HP" then return c.hp end
+        if key == "Highest HP" then return -c.hp end
+        return 0
+    end
+
+    local function pickAuraTarget()
+        local myRoot = getRoot()
+        if not myRoot then return nil end
+        local candidates = {}
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if pl ~= LocalPlayer and not AuraSafe[pl.Name] then
+                local char = pl.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                if root and hum and hum.Health > 0 then
+                    local d = (root.Position - myRoot.Position).Magnitude
+                    if d <= AURA_RANGE then
+                        candidates[#candidates + 1] = { hum = hum, dist = d, hp = hum.Health }
+                    end
+                end
+            end
+        end
+        if #candidates == 0 then return nil end
+        table.sort(candidates, function(a, b)
+            for _, key in ipairs(Priority) do
+                local va, vb = keyValue(a, key), keyValue(b, key)
+                if va ~= vb then return va < vb end
+            end
+            return a.dist < b.dist
+        end)
+        return candidates[1].hum
+    end
+
+    local function auraStep()
+        local remote = getAttackRemote()
+        if not remote then return end
+        local hum = pickAuraTarget()
+        if hum then
+            remote:FireServer(hum)
+        end
+    end
+
+    task.spawn(function()
+        while alive do
+            task.wait(math.max(0.05, Aura.delay))
+            if Aura.on then
+                local ok, err = pcall(auraStep)
+                if not ok then warn("[AnimalFarm] kill aura error: " .. tostring(err)) end
+            end
+        end
+    end)
+
+
     CombatTab:Section({ Title = "Kill Aura" })
 
     local AuraToggle
@@ -2494,7 +3010,9 @@ do
         Flag = "KillAuraOn",
         Callback = function(v)
             if not v then
+                local wasOn = Aura.on
                 Aura.on = false
+                if wasOn then notify("Kill Aura Turned Off", "") end
                 return
             end
             task.spawn(function()
@@ -2503,7 +3021,9 @@ do
                     pcall(function() AuraToggle:Set(false) end)
                     return
                 end
+                local wasOn = Aura.on
                 Aura.on = true
+                if not wasOn then notify("Kill Aura Turned On", "") end
             end)
         end,
     })
@@ -2552,59 +3072,36 @@ do
         end
     end)
 
-    -- ---- kill aura keybind: press a key to record it, no manual typing ----
-    local AuraKey, capturingAuraKey
-    local AuraKeyLabel = CombatTab:Paragraph({ Title = "Kill Aura key: none" })
-
-    local function setAuraKey(name)
-        local ok, kc = pcall(function() return Enum.KeyCode[name] end)
-        if not (ok and kc and kc ~= Enum.KeyCode.Unknown) then return false end
-        AuraKey = kc
-        Values.KillAuraKey = kc.Name
-        setLabel(AuraKeyLabel, "Kill Aura key: " .. kc.Name)
-        return true
-    end
-    applyConfigAuraKey = function(name) return setAuraKey(name) end
-
-
-
-    CombatTab:Button({
-        Title = "Set Kill Aura Key (then press a key)",
-        Callback = function()
-            capturingAuraKey = true
-            notify("Press a key", "Press the key that turns Kill Aura on/off (Esc cancels)")
-        end,
-    })
-
-    local auraKeyConn = UIS.InputBegan:Connect(function(input, gp)
-        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-        if capturingAuraKey then
-            capturingAuraKey = false
-            if input.KeyCode == Enum.KeyCode.Escape then
-                notify("Cancelled", "Kill Aura key unchanged")
-            elseif setAuraKey(input.KeyCode.Name) then
-                notify("Kill Aura key", input.KeyCode.Name)
-            end
-            return
-        end
-        if gp then return end -- typing in a text box etc.
-        if AuraKey and input.KeyCode == AuraKey then
-            pcall(function() AuraToggle:Set(not Aura.on) end)
-        end
-    end)
-
     local plConns = {
-        Players.PlayerAdded:Connect(function()
-            task.defer(refreshHitList)
-            task.defer(refreshAuraList)
-        end),
-        Players.PlayerRemoving:Connect(function()
-            task.delay(0.3, refreshHitList)
-            task.delay(0.3, refreshAuraList)
-        end),
+        Players.PlayerAdded:Connect((function()
+            local queued = false
+            return function()
+                if queued then return end
+                queued = true
+                task.delay(1, function()
+                    queued = false
+                    if not alive then return end
+                    if refreshHitList then refreshHitList() end
+                    if refreshAuraList then refreshAuraList() end
+                end)
+            end
+        end)()),
+        Players.PlayerRemoving:Connect((function()
+            local queued = false
+            return function()
+                if queued then return end
+                queued = true
+                task.delay(1, function()
+                    queued = false
+                    if not alive then return end
+                    if refreshHitList then refreshHitList() end
+                    if refreshAuraList then refreshAuraList() end
+                end)
+            end
+        end)()),
     }
 
-    -- ---------- auto escape latch ----------
+    -- ---------- anti grab ----------
     local Latch = { on = false, delay = 0.1 }
     local LatchedRemote
 
@@ -2646,7 +3143,7 @@ do
                             local remote = getLatchRemote()
                             if remote then remote:FireServer() end
                         end)
-                        if not ok then warn("[AnimalFarm] auto escape latch error: " .. tostring(err)) end
+                        if not ok then warn("[AnimalFarm] anti grab error: " .. tostring(err)) end
                         if attempts < MAX_ATTEMPTS and Latch.on and isLatched() then
                             task.wait(RETRY_GAP)
                         end
@@ -2658,22 +3155,582 @@ do
     end)
 
 
-    CombatTab:Section({ Title = "Auto Escape Latch" })
+    local AutoWhitelistGroup = { on = false }
+    CombatTab:Section({ Title = "Auto Whitelist" })
+    CombatTab:Toggle({
+        Title = "Whitelist Group",
+        Value = false,
+        Flag = "AutoWhitelistGroupOn",
+        Callback = function(v) AutoWhitelistGroup.on = v end,
+    })
+
+    ;(function()
+        local AutoWhitelistFriends = { on = false, loaded = false, ids = {} }
+
+        local function addFriendToWhitelists(player)
+            if not AutoWhitelistFriends.on or not player or player == LocalPlayer then return end
+            if not AutoWhitelistFriends.ids[player.UserId] then return end
+            local changed = false
+            if HitSafe and not HitSafe[player.Name] then
+                HitSafe[player.Name] = true
+                changed = true
+            end
+            if AuraSafe and not AuraSafe[player.Name] then
+                AuraSafe[player.Name] = true
+                changed = true
+            end
+            if changed then
+                if refreshHitList then refreshHitList() end
+                if refreshAuraList then refreshAuraList() end
+                if ConfigReady then task.defer(saveServerSafeLists) end
+            end
+        end
+
+        local function loadFriends()
+            local ok, pages = pcall(function()
+                return Players:GetFriendsAsync(LocalPlayer.UserId)
+            end)
+            if not ok or not pages then
+                warn("[AnimalFarm] Could not load Roblox friends: " .. tostring(pages))
+                return false
+            end
+            local ids = {}
+            repeat
+                local pageOk, page = pcall(function() return pages:GetCurrentPage() end)
+                if pageOk and type(page) == "table" then
+                    for _, friend in ipairs(page) do
+                        local userId = tonumber(friend.Id or friend.id)
+                        if userId then ids[userId] = true end
+                    end
+                end
+                if pages.IsFinished then break end
+                local nextOk = pcall(function() pages:AdvanceToNextPageAsync() end)
+                if not nextOk then break end
+            until false
+            AutoWhitelistFriends.ids = ids
+            AutoWhitelistFriends.loaded = true
+            return true
+        end
+
+        CombatTab:Toggle({
+            Title = "Whitelist Friends",
+            Value = false,
+            Flag = "WhitelistFriendsOn",
+            Callback = function(v)
+                AutoWhitelistFriends.on = v
+                if not v then return end
+                task.spawn(function()
+                    if not AutoWhitelistFriends.loaded and not loadFriends() then return end
+                    for _, player in ipairs(Players:GetPlayers()) do
+                        addFriendToWhitelists(player)
+                    end
+                end)
+            end,
+        })
+
+        table.insert(plConns, Players.PlayerAdded:Connect(function(player)
+            task.defer(function() addFriendToWhitelists(player) end)
+        end))
+
+
+        ;(function()
+            local AnimalNameWhitelist = { query = "" }
+
+            local function normalizeName(value)
+                return tostring(value or ""):lower():gsub("[^%w]", "")
+            end
+
+            local function editDistanceAtMostOne(a, b)
+                if math.abs(#a - #b) > 1 then return false end
+                local i, j, edits = 1, 1, 0
+                while i <= #a and j <= #b do
+                    if a:sub(i, i) == b:sub(j, j) then
+                        i += 1
+                        j += 1
+                    else
+                        edits += 1
+                        if edits > 1 then return false end
+                        if #a > #b then
+                            i += 1
+                        elseif #b > #a then
+                            j += 1
+                        else
+                            i += 1
+                            j += 1
+                        end
+                    end
+                end
+                if i <= #a or j <= #b then edits += 1 end
+                return edits <= 1
+            end
+
+            local function animalNameMatches(animalName, query)
+                local animal, wanted = normalizeName(animalName), normalizeName(query)
+                if #wanted < 2 or #animal == 0 then return false end
+                if animal:find(wanted, 1, true) then return true end
+
+                -- Also accept a close spelling: compare query-sized chunks and
+                -- allow one insertion, deletion, or substitution.
+                local minLen, maxLen = math.max(1, #wanted - 1), #wanted + 1
+                for length = minLen, maxLen do
+                    if length <= #animal then
+                        for i = 1, #animal - length + 1 do
+                            if editDistanceAtMostOne(animal:sub(i, i + length - 1), wanted) then
+                                return true
+                            end
+                        end
+                    end
+                end
+                return false
+            end
+
+            local function readAnimalName(model, player)
+                if not model then return nil end
+
+                local function cleanText(value)
+                    if type(value) ~= "string" then return nil end
+                    value = value:gsub("^%s*(.-)%s*$", "%1")
+                    if value == "" or #value > 48 then return nil end
+                    if player and (value:lower() == player.Name:lower()
+                        or value:lower() == player.DisplayName:lower()) then return nil end
+                    return value
+                end
+
+                -- The overhead nameplate is the animal's custom name (for example, "Farm").
+                -- Prefer its BillboardGui text over AnimalName, which is the species (e.g. Gallimimus).
+                local candidates = {}
+                for _, item in ipairs(model:GetDescendants()) do
+                    if item:IsA("BillboardGui") then
+                        for _, label in ipairs(item:GetDescendants()) do
+                            if label:IsA("TextLabel") or label:IsA("TextButton") then
+                                local value = cleanText(label.Text)
+                                if value then
+                                    local lower = value:lower()
+                                    -- Ignore species/age/gender/status lines from the nameplate.
+                                    if not lower:find("|", 1, true)
+                                        and not lower:find("gallimimus", 1, true)
+                                        and not lower:find("juvenile", 1, true)
+                                        and not lower:find("adult", 1, true)
+                                        and not lower:find("female", 1, true)
+                                        and not lower:find("male", 1, true) then
+                                        local key = label.Name:lower()
+                                        local priority = (key:find("animal", 1, true) or key:find("name", 1, true)) and 0 or 1
+                                        table.insert(candidates, { text = value, priority = priority })
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                table.sort(candidates, function(a, b) return a.priority < b.priority end)
+                if candidates[1] then return candidates[1].text end
+
+                -- Some game versions expose the custom name as a model attribute.
+                for _, attribute in ipairs({ "AnimalDisplayName", "CustomName", "NameTag", "UniqueCharacterName" }) do
+                    local ok, value = pcall(function() return model:GetAttribute(attribute) end)
+                    value = ok and cleanText(value) or nil
+                    if value then return value end
+                end
+
+                -- Fallback to species only if no custom overhead name is available.
+                local ok, value = pcall(function() return model:GetAttribute("AnimalName") end)
+                if ok then return cleanText(value) end
+                return nil
+            end
+
+            local function getPlayerAnimalName(player)
+                if not player then return nil end
+
+                -- First try Roblox's assigned character model.
+                local value = readAnimalName(player.Character, player)
+                if value then return value end
+
+                -- This game also parents player animal models directly under Workspace
+                -- (for example Workspace.Madzsilver), so do not rely only on Player.Character.
+                local workspaceModel = workspace:FindFirstChild(player.Name)
+                value = readAnimalName(workspaceModel, player)
+                if value then return value end
+
+                -- Do not scan all of Workspace. Only inspect this player's known models.
+                return nil
+            end
+
+            local function addAnimalMatch(player)
+                local query = AnimalNameWhitelist.query
+                if query == "" or not player or player == LocalPlayer or player.Parent ~= Players then return end
+                local animalName = getPlayerAnimalName(player)
+                if not animalName or not animalNameMatches(animalName, query) then return end
+
+                local changed = false
+                if HitSafe and not HitSafe[player.Name] then
+                    HitSafe[player.Name] = true
+                    changed = true
+                end
+                if AuraSafe and not AuraSafe[player.Name] then
+                    AuraSafe[player.Name] = true
+                    changed = true
+                end
+                if changed then
+                    if refreshHitList then refreshHitList() end
+                    if refreshAuraList then refreshAuraList() end
+                    if ConfigReady then task.defer(saveServerSafeLists) end
+                end
+            end
+
+            local function scanAnimalMatches()
+                if AnimalNameWhitelist.query == "" then return end
+                for _, player in ipairs(Players:GetPlayers()) do
+                    addAnimalMatch(player)
+                end
+            end
+
+            local inputPlaceholder = "Enter an animal name (e.g. Farm)"
+
+            local function clearAnimalWhitelistInput()
+                task.defer(function()
+                    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+                    if not playerGui then return end
+                    for _, item in ipairs(playerGui:GetDescendants()) do
+                        if item:IsA("TextBox") and item.PlaceholderText == inputPlaceholder then
+                            item.Text = ""
+                        end
+                    end
+                end)
+            end
+
+            CombatTab:Input({
+                Title = "Whitelist By Animal Name",
+                Placeholder = inputPlaceholder,
+                Value = "",
+                Flag = "WhitelistByAnimalName",
+                Callback = function(value)
+                    -- WindUI submits this callback when Enter is pressed or the field loses focus.
+                    if type(value) == "table" then
+                        value = value.Text or value.Value or value.text or value.value or ""
+                    end
+                    local query = normalizeName(value)
+                    if query ~= "" then
+                        AnimalNameWhitelist.query = query
+                        scanAnimalMatches()
+                    end
+                    clearAnimalWhitelistInput()
+                end,
+            })
+
+            -- Intentionally event-free: matching runs once when the user submits the input.
+            -- No background polling, PlayerAdded hooks, or Workspace descendant watchers.
+        end)()
+    end)()
+
+    local function setupGroupWhitelist()
+    local GroupAutoAdded = GroupAutoAddedOwnership
+    local confirmedGroupMembers
+
+    local function getCurrentGroupMembers()
+        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        local statsGui = playerGui and playerGui:FindFirstChild("AnimalStatsScreenGui")
+        local groupingFrame = statsGui and statsGui:FindFirstChild("GroupingFrame", true)
+        local myGroupFrame = groupingFrame and groupingFrame:FindFirstChild("MyGroupScrollingFrame", true)
+        local inGroupFrame = myGroupFrame and myGroupFrame:FindFirstChild("InGroupFrame", true)
+        if not inGroupFrame then return nil end
+
+
+        local textValues, playerValues, userIds = {}, {}, {}
+        for _, item in ipairs(inGroupFrame:GetDescendants()) do
+            if item:IsA("ObjectValue") and item.Value and item.Value:IsA("Player") then
+                playerValues[item.Value.Name] = true
+            elseif item:IsA("IntValue") or item:IsA("NumberValue") then
+                if type(item.Value) == "number" then userIds[item.Value] = true end
+            elseif item:IsA("StringValue") and item.Value ~= "" then
+                textValues[#textValues + 1] = string.lower(item.Value)
+            end
+
+            if item.Name and item.Name ~= "" then
+                textValues[#textValues + 1] = string.lower(item.Name)
+            end
+            if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
+                local text = ""
+                pcall(function() text = item.Text end)
+                if text ~= "" then textValues[#textValues + 1] = string.lower(text) end
+            end
+            for key, value in pairs(item:GetAttributes()) do
+                local keyLower = string.lower(tostring(key))
+                if keyLower:find("user", 1, true) or keyLower:find("player", 1, true)
+                    or keyLower:find("member", 1, true) or keyLower:find("name", 1, true) then
+                    if type(value) == "number" then
+                        userIds[value] = true
+                    elseif type(value) == "string" and value ~= "" then
+                        textValues[#textValues + 1] = string.lower(value)
+                    end
+                end
+            end
+        end
+
+        local members = {}
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local name = string.lower(player.Name)
+                local displayName = string.lower(player.DisplayName)
+                local matched = playerValues[player.Name] == true or userIds[player.UserId] == true
+                if not matched then
+                    for _, value in ipairs(textValues) do
+                        if string.find(value, name, 1, true)
+                            or (displayName ~= "" and string.find(value, displayName, 1, true)) then
+                            matched = true
+                            break
+                        end
+                    end
+                end
+                if matched then members[player.Name] = true end
+            end
+        end
+        return members
+    end
+    local function promptToWhitelistGroupMember(player)
+        local playerName = player.Name
+        pcall(function()
+            WindUI:Notify({
+                Title = "Group Member Detected",
+                Content = "Would you like to whitelist " .. playerName .. "?",
+                Duration = 10,
+                Buttons = {
+                    {
+                        Title = "✓",
+                        Callback = function()
+                            if not AutoWhitelistGroup.on or not confirmedGroupMembers
+                                or not confirmedGroupMembers[playerName] or player.Parent ~= Players then return end
+                            local liveMembers = getCurrentGroupMembers()
+                            if not liveMembers or not liveMembers[playerName] then return end
+                            local addedHit, addedAura = false, false
+                            if not HitSafe[playerName] then HitSafe[playerName] = true; addedHit = true end
+                            if not AuraSafe[playerName] then AuraSafe[playerName] = true; addedAura = true end
+                            GroupAutoAdded[playerName] = {
+                                Hitbox = addedHit,
+                                KillAura = addedAura,
+                            }
+                            if refreshHitList then refreshHitList() end
+                            if refreshAuraList then refreshAuraList() end
+                            if ConfigReady then task.defer(saveServerSafeLists) end
+                        end,
+                    },
+                    {
+                        Title = "✕",
+                        Callback = function() end,
+                    },
+                },
+            })
+        end)
+    end
+
+    task.spawn(function()
+        while alive do
+            task.wait(0.75)
+            local scanOk, currentMembers = pcall(getCurrentGroupMembers)
+            if not scanOk then
+                warn("[AnimalFarm] group membership scan error: " .. tostring(currentMembers))
+                currentMembers = nil
+            end
+            if currentMembers then
+                if not confirmedGroupMembers then
+                    confirmedGroupMembers = currentMembers
+                else
+                    for playerName in pairs(currentMembers) do
+                        if not confirmedGroupMembers[playerName] then
+                            confirmedGroupMembers[playerName] = true
+                            local player = Players:FindFirstChild(playerName)
+                            if AutoWhitelistGroup.on and player then
+                                promptToWhitelistGroupMember(player)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    end
+    setupGroupWhitelist()
+
+    CombatTab:Section({ Title = "Anti Grab" })
 
     CombatTab:Toggle({
-        Title = "Auto Escape Latch",
+        Title = "Anti Grab",
         Value = false,
         Flag = "AutoEscapeLatchOn",
         Callback = function(v) Latch.on = v end,
     })
 
     CombatTab:Slider({
-        Title = "Latch Escape Delay",
+        Title = "Anti Grab Delay",
         Step = 0.05,
         Value = { Min = 0, Max = 1, Default = Latch.delay },
         Flag = "LatchEscapeDelay",
         Callback = function(v) Latch.delay = math.clamp(v, 0, 1) end,
     })
+
+    ;(function()
+    local PredatorAlert = { on = false, distanceMeters = 10, ignoredPlayers = {} }
+    local predatorSound = Instance.new("Sound")
+    predatorSound.Name = "StimmyPredatorAlert"
+    predatorSound.SoundId = "rbxassetid://5907971820"
+    predatorSound.Volume = 1
+    predatorSound.Looped = true
+    predatorSound.Parent = game:GetService("SoundService")
+    local predatorAlarmGeneration = 0
+    local function stopPredatorAlarm()
+        predatorAlarmGeneration += 1
+        pcall(function() predatorSound:Stop() end)
+    end
+    local function startPredatorAlarm()
+        predatorAlarmGeneration += 1
+        local generation = predatorAlarmGeneration
+        pcall(function()
+            if not predatorSound.IsPlaying then
+                predatorSound.TimePosition = 0
+                predatorSound:Play()
+            end
+        end)
+        task.delay(6, function()
+            if generation == predatorAlarmGeneration then
+                pcall(function() predatorSound:Stop() end)
+            end
+        end)
+    end
+    local function closePredatorNotice()
+        local notice = predatorNotice
+        predatorNotice = nil
+        if notice and not notice.Closed then
+            task.spawn(function() pcall(function() notice:Close() end) end)
+        end
+    end
+
+    CombatTab:Toggle({
+        Title = "Predator Alert",
+        Value = false,
+        Flag = "PredatorAlertOn",
+        Callback = function(v)
+            PredatorAlert.on = v
+            if not v then
+                stopPredatorAlarm()
+                closePredatorNotice()
+            end
+        end,
+    })
+
+    CombatTab:Slider({
+        Title = "Predator Alert Distance (M)",
+        Step = 1,
+        Value = { Min = 1, Max = 100, Default = PredatorAlert.distanceMeters },
+        Flag = "PredatorAlertDistance",
+        Callback = function(v) PredatorAlert.distanceMeters = math.clamp(v, 1, 100) end,
+    })
+
+    local ignorePlayersDropdown
+    local ignorePlayerNames = {}
+    local ignorePlayerMuteUntil = 0
+    local function getIgnorePlayerNames()
+        local names, seen = {}, {}
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                names[#names + 1] = player.Name
+                seen[player.Name] = true
+            end
+        end
+        for name in pairs(PredatorAlert.ignoredPlayers) do
+            if not seen[name] then names[#names + 1] = name end
+        end
+        table.sort(names, function(a, b) return a:lower() < b:lower() end)
+        return names
+    end
+    local function refreshIgnorePlayerNames()
+        ignorePlayerNames = getIgnorePlayerNames()
+        ignorePlayerMuteUntil = tick() + 0.5
+        pcall(function() ignorePlayersDropdown:Refresh(ignorePlayerNames, true) end)
+        local selected = {}
+        for _, name in ipairs(ignorePlayerNames) do
+            if PredatorAlert.ignoredPlayers[name] then selected[#selected + 1] = name end
+        end
+        pcall(function() ignorePlayersDropdown:Select(selected) end)
+    end
+    ignorePlayerNames = getIgnorePlayerNames()
+    ignorePlayersDropdown = CombatTab:Dropdown({
+        Title = "Ignore Player",
+        Values = ignorePlayerNames,
+        Value = {},
+        Multi = true,
+        AllowNone = true,
+        SearchBarEnabled = true,
+        Callback = function(options)
+            if tick() < ignorePlayerMuteUntil or type(options) ~= "table" then return end
+            local selected = {}
+            for _, option in pairs(options) do
+                local name = type(option) == "table" and (option.Title or option.Name) or option
+                if type(name) == "string" then selected[name] = true end
+            end
+            PredatorAlert.ignoredPlayers = selected
+        end,
+    })
+    table.insert(plConns, Players.PlayerAdded:Connect(function()
+        task.defer(refreshIgnorePlayerNames)
+    end))
+    table.insert(plConns, Players.PlayerRemoving:Connect(function()
+        task.delay(0.3, refreshIgnorePlayerNames)
+    end))
+
+    task.spawn(function()
+        local nextAlertAt = 0
+        while alive do
+            task.wait(0.2)
+            local inRangePlayers = {}
+            if PredatorAlert.on then
+                local myCharacter = LocalPlayer.Character
+                local myRoot = myCharacter and myCharacter:FindFirstChild("HumanoidRootPart")
+                if myRoot then
+                    local rangeStuds = PredatorAlert.distanceMeters / 0.28
+                    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+                        if otherPlayer ~= LocalPlayer and not PredatorAlert.ignoredPlayers[otherPlayer.Name] then
+                            local character = otherPlayer.Character
+                            local root = character and character:FindFirstChild("HumanoidRootPart")
+                            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                            if root and humanoid and humanoid.Health > 0
+                                and (root.Position - myRoot.Position).Magnitude <= rangeStuds then
+                                inRangePlayers[#inRangePlayers + 1] = otherPlayer
+                            end
+                        end
+                    end
+                end
+            end
+
+            if #inRangePlayers == 0 then
+                nextAlertAt = 0
+                stopPredatorAlarm()
+                closePredatorNotice()
+            elseif tick() >= nextAlertAt then
+                table.sort(inRangePlayers, function(a, b) return a.Name:lower() < b.Name:lower() end)
+                local alertedPlayers, lines = {}, {}
+                for _, player in ipairs(inRangePlayers) do
+                    alertedPlayers[#alertedPlayers + 1] = player
+                    local character = player.Character
+                    local animalName = character and (character:GetAttribute("AnimalName")
+                        or character:GetAttribute("CharacterName")) or "Unknown Animal"
+                    lines[#lines + 1] = string.format("%s — %s", player.Name, tostring(animalName))
+                end
+                notify("⚠️ Danger Alert ⚠️", table.concat(lines, "\n"), 6, function()
+                    for _, player in ipairs(alertedPlayers) do
+                        PredatorAlert.ignoredPlayers[player.Name] = true
+                    end
+                    refreshIgnorePlayerNames()
+                    stopPredatorAlarm()
+                end)
+                startPredatorAlarm()
+                nextAlertAt = tick() + 2.5
+            end
+        end
+        stopPredatorAlarm()
+        closePredatorNotice()
+        pcall(function() predatorSound:Destroy() end)
+    end)
+
+    end)()
 
     HitboxCleanup = function()
         Hit.on = false
@@ -2792,7 +3849,7 @@ do
     local removingConn = Players.PlayerRemoving:Connect(cleanupPlayer)
 
     -- Object ESP uses matching instance names and shares the main ESP toggle/distance filter.
-    local ObjectESP = { carcass = false, targets = {}, highlights = {}, labels = {}, nextScan = 0 }
+    local ObjectESP = { carcass = false, targets = {}, highlights = {}, labels = {}, nextScan = 0, scanning = false, nextVisualUpdate = 0 }
 
     local function objectKind(inst)
         if not inst:IsA("Model") then return nil end
@@ -2837,67 +3894,88 @@ do
             return
         end
 
-        if tick() >= ObjectESP.nextScan then
+        if tick() >= ObjectESP.nextScan and not ObjectESP.scanning then
             ObjectESP.nextScan = tick() + 2
-            local found = {}
-            for _, inst in ipairs(workspace:GetDescendants()) do
-                local kind = objectKind(inst)
-                if kind == "carcass" and ObjectESP.carcass and not hasMatchingAncestor(inst, kind) then
-                    found[inst] = kind
-                end
-            end
-            ObjectESP.targets = found
-
-            for inst, highlight in pairs(ObjectESP.highlights) do
-                if not found[inst] or not inst:IsDescendantOf(workspace) then
-                    pcall(function() highlight:Destroy() end)
-                    ObjectESP.highlights[inst] = nil
-                    local label = ObjectESP.labels[inst]
-                    if label then pcall(function() label:Destroy() end) end
-                    ObjectESP.labels[inst] = nil
-                end
-            end
-            for inst, kind in pairs(found) do
-                local color = kind == "carcass" and Color3.fromRGB(255, 45, 45) or Color3.new(1, 1, 1)
-                if not ObjectESP.highlights[inst] then
-                    local highlight = Instance.new("Highlight")
-                    highlight.Name = "AnimalFarmObjectESP"
-                    highlight.FillColor = color
-                    highlight.OutlineColor = color
-                    highlight.FillTransparency = 0.65
-                    highlight.OutlineTransparency = 0
-                    highlight.Adornee = inst
-                    highlight.Parent = inst
-                    ObjectESP.highlights[inst] = highlight
-                end
-
-                -- Retry label creation on every scan in case the carcass model's parts load later.
-                if kind == "carcass" and not ObjectESP.labels[inst] then
-                    local adornee = inst:IsA("BasePart") and inst or inst:FindFirstChildWhichIsA("BasePart", true)
-                    if adornee then
-                        local billboard = Instance.new("BillboardGui")
-                        billboard.Name = "AnimalFarmCarcassLabel"
-                        billboard.Adornee = adornee
-                        billboard.AlwaysOnTop = true
-                        billboard.Size = UDim2.fromOffset(110, 24)
-                        billboard.StudsOffset = Vector3.new(0, 2, 0)
-                        billboard.Parent = LocalPlayer:FindFirstChildOfClass("PlayerGui") or inst
-
-                        local text = Instance.new("TextLabel")
-                        text.BackgroundTransparency = 1
-                        text.Size = UDim2.fromScale(1, 1)
-                        text.Font = Enum.Font.GothamBold
-                        text.Text = "Carcass"
-                        text.TextColor3 = color
-                        text.TextSize = 14
-                        text.TextStrokeTransparency = 0.25
-                        text.Parent = billboard
-                        ObjectESP.labels[inst] = billboard
+            ObjectESP.scanning = true
+            task.spawn(function()
+                local scanOk, foundOrError = pcall(function()
+                    local found = {}
+                    local pending = workspace:GetChildren()
+                    local scanned = 0
+                    while #pending > 0 do
+                        local inst = table.remove(pending)
+                        scanned += 1
+                        local kind = objectKind(inst)
+                        if kind == "carcass" and not hasMatchingAncestor(inst, kind) then
+                            found[inst] = kind
+                        end
+                        for _, child in ipairs(inst:GetChildren()) do
+                            pending[#pending + 1] = child
+                        end
+                        if scanned % 400 == 0 then task.wait() end
                     end
+                    if not alive or not ESP.on or not ObjectESP.carcass then return true end
+                    ObjectESP.targets = found
+
+                    for inst, highlight in pairs(ObjectESP.highlights) do
+                        if not found[inst] or not inst:IsDescendantOf(workspace) then
+                            pcall(function() highlight:Destroy() end)
+                            ObjectESP.highlights[inst] = nil
+                            local label = ObjectESP.labels[inst]
+                            if label then pcall(function() label:Destroy() end) end
+                            ObjectESP.labels[inst] = nil
+                        end
+                    end
+                    for inst, kind in pairs(found) do
+                        local color = kind == "carcass" and Color3.fromRGB(255, 45, 45) or Color3.new(1, 1, 1)
+                        if not ObjectESP.highlights[inst] then
+                            local highlight = Instance.new("Highlight")
+                            highlight.Name = "AnimalFarmObjectESP"
+                            highlight.FillColor = color
+                            highlight.OutlineColor = color
+                            highlight.FillTransparency = 0.65
+                            highlight.OutlineTransparency = 0
+                            highlight.Adornee = inst
+                            highlight.Parent = inst
+                            ObjectESP.highlights[inst] = highlight
+                        end
+
+                        if kind == "carcass" and not ObjectESP.labels[inst] then
+                            local adornee = inst:IsA("BasePart") and inst or inst:FindFirstChildWhichIsA("BasePart", true)
+                            if adornee then
+                                local billboard = Instance.new("BillboardGui")
+                                billboard.Name = "AnimalFarmCarcassLabel"
+                                billboard.Adornee = adornee
+                                billboard.AlwaysOnTop = true
+                                billboard.Size = UDim2.fromOffset(110, 24)
+                                billboard.StudsOffset = Vector3.new(0, 2, 0)
+                                billboard.Parent = LocalPlayer:FindFirstChildOfClass("PlayerGui") or inst
+
+                                local text = Instance.new("TextLabel")
+                                text.BackgroundTransparency = 1
+                                text.Size = UDim2.fromScale(1, 1)
+                                text.Font = Enum.Font.GothamBold
+                                text.Text = "Carcass"
+                                text.TextColor3 = color
+                                text.TextSize = 14
+                                text.TextStrokeTransparency = 0.25
+                                text.Parent = billboard
+                                ObjectESP.labels[inst] = billboard
+                            end
+                        end
+                    end
+                    return true
+                end)
+                if not scanOk then
+                    warn("[AnimalFarm] object ESP scan error: " .. tostring(foundOrError))
                 end
-            end
+                ObjectESP.nextScan = tick() + 2
+                ObjectESP.scanning = false
+            end)
         end
 
+        if tick() < ObjectESP.nextVisualUpdate then return end
+        ObjectESP.nextVisualUpdate = tick() + 0.1
         local cameraPosition = Camera.CFrame.Position
         for inst, highlight in pairs(ObjectESP.highlights) do
             local pos = objectPosition(inst)
@@ -3114,6 +4192,7 @@ do
         end
     end
 
+    local espWarnings = {}
     local renderConn
     local function startRender()
         if renderConn then return end
@@ -3123,7 +4202,12 @@ do
                 if pl ~= LocalPlayer then
                     local o = ensure(pl)
                     local ok, err = pcall(updateFor, pl, o)
-                    if not ok then warn("[AnimalFarm] ESP error: " .. tostring(err)) end
+                    if not ok and not espWarnings[pl] then
+                        espWarnings[pl] = true
+                        warn("[AnimalFarm] ESP error: " .. tostring(err))
+                    elseif ok then
+                        espWarnings[pl] = nil
+                    end
                 end
             end
         end)
@@ -3143,7 +4227,7 @@ do
 
     local ESPToggle
     ESPToggle = VisualsTab:Toggle({
-        Title = "ESP Enabled [F1]",
+        Title = "ESP Enabled",
         Value = false,
         Flag = "ESPOn",
         Callback = function(v)
@@ -3157,13 +4241,6 @@ do
             if v then startRender() else stopRender() end
         end,
     })
-
-    local espKeyConn = UIS.InputBegan:Connect(function(input, gp)
-        if gp then return end
-        if input.KeyCode == Enum.KeyCode.F1 then
-            pcall(function() ESPToggle:Set(not ESP.on) end)
-        end
-    end)
 
     VisualsTab:Toggle({
         Title = "Box ESP",
@@ -3287,6 +4364,84 @@ do
     end
 end
 
+-- ================= WEATHER & TIME EFFECTS =================
+-- Keep these connections separate so they can be cleanly stopped on rerun.
+local weatherTerrainChildConn = workspace.Terrain.ChildAdded:Connect(function(child)
+    if not Config.AntiRainEnabled then return end
+    if child.Name == "__RainOccludedAttachment" or child.Name == "__RainSplashAttachment" then
+        task.defer(function()
+            pcall(function() child:Destroy() end)
+        end)
+    end
+end)
+
+local weatherWorkspaceChildConn = workspace.ChildAdded:Connect(function(child)
+    if not Config.AntiRainEnabled then return end
+    if child.Name == "StrongWindNoiseLoop" or child.Name == "ThunderRumbleBackgroundSound" then
+        if child:IsA("Sound") then
+            task.defer(function()
+                pcall(function()
+                    child.Playing = false
+                    child.Volume = 0
+                end)
+            end)
+        end
+    end
+end)
+
+local lastWeatherCheck = 0
+local weatherRenderConn = RunService.RenderStepped:Connect(function()
+    local now = tick()
+    if now - lastWeatherCheck < 0.5 then return end
+    lastWeatherCheck = now
+
+    -- Disable the game's rain handler only while Anti-Rain is enabled.
+    local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
+    if playerScripts then
+        local core = playerScripts:FindFirstChild("AnimalGameSharedCore")
+        local maps = core and core:FindFirstChild("MapScripts")
+        local rainHandler = maps and maps:FindFirstChild("RainHandler")
+        if rainHandler and rainHandler:IsA("LocalScript") then
+            if rainHandler.Disabled ~= Config.AntiRainEnabled then
+                rainHandler.Disabled = Config.AntiRainEnabled
+            end
+        end
+    end
+
+    if Config.AntiRainEnabled then
+        local camera = workspace.CurrentCamera
+        local emitter = camera and camera:FindFirstChild("__RainEmitter")
+        if emitter then
+            pcall(function()
+                emitter.Size = Vector3.new(0, 0, 0)
+                for _, particle in ipairs(emitter:GetChildren()) do
+                    if particle:IsA("ParticleEmitter") then
+                        particle.Enabled = false
+                    end
+                end
+            end)
+        end
+
+        for _, child in ipairs(workspace.Terrain:GetChildren()) do
+            if child.Name == "__RainOccludedAttachment" or child.Name == "__RainSplashAttachment" then
+                pcall(function() child:Destroy() end)
+            end
+        end
+
+        for _, child in ipairs(workspace:GetChildren()) do
+            if child.Name == "StrongWindNoiseLoop" or child.Name == "ThunderRumbleBackgroundSound" then
+                if child:IsA("Sound") then
+                    pcall(function()
+                        child.Playing = false
+                        child.Volume = 0
+                    end)
+                end
+            end
+        end
+    end
+
+end)
+
 local MovementTab = Window:Tab({ Title = "Movement", Icon = "move" })
 hook(MovementTab)
 
@@ -3300,12 +4455,32 @@ local StatusLabel = Tab:Paragraph({ Title = "Status: Idle" })
 
 local DrinkToggle, EatToggle
 
+Tab:Dropdown({
+    Title = "Travel Method",
+    Values = { "Blink", "Tween" },
+    Value = Config.TravelMethod,
+    Multi = false,
+    AllowNone = false,
+    SearchBarEnabled = false,
+    Callback = function(value)
+        if value == "Blink" or value == "Tween" then
+            Config.TravelMethod = value
+        end
+    end,
+})
+
 DrinkToggle = Tab:Toggle({
     Title = "Auto Drink",
     Value = false,
     Flag = "AutoDrink",
     Callback = function(v)
         State.Drinking = v
+        if not v and State.Busy and State.CurrentKind == "Water" then
+            State.Cancel = true
+            stopHold()
+            -- If the game is currently in its drinking substate, request an immediate stop.
+            if promptStop("Water") then task.spawn(function() pcall(Kinds.Water.fire) end) end
+        end
         if not v then task.spawn(releaseWater) end
         -- start right away; threshold only applies to later cycles
         if v and not State.Busy then task.spawn(runCycle, "Water", false) end
@@ -3318,6 +4493,11 @@ EatToggle = Tab:Toggle({
     Flag = "AutoEat",
     Callback = function(v)
         State.Eating = v
+        if not v and State.Busy and State.CurrentKind == "Food" then
+            State.Cancel = true
+            stopHold()
+            task.spawn(stopFoodAction)
+        end
         if v and not State.Busy then task.spawn(runCycle, "Food", false) end
     end,
 })
@@ -3328,8 +4508,6 @@ Tab:Toggle({
     Flag = "NoclipMove",
     Callback = function(v) State.NoclipMove = v refreshNoclip() end,
 })
-
-Tab:Section({ Title = "Auto Spawn" })
 
 local AutoSpawn = { on = false, busy = false, awaitingSpawn = false, character = "StarterCharacter1", lastRequest = 0, lastErrorNotice = 0 }
 
@@ -3405,6 +4583,370 @@ local function getSavedCharacterNames()
     if #names == 0 then names = { "StarterCharacter1", "StarterCharacter2" } end
     return names
 end
+
+-- ================= AUTO GROW =================
+;(function()
+-- Queue saved animals, watch the active character's GrowthPercentage, then reset and spawn the next.
+Tab:Section({ Title = "Auto Grow" })
+
+local AutoGrow = {
+    on = false,
+    queue = {},
+    current = nil,
+    busy = false,
+    tracker = {},
+    pausedEat = false,
+    pausedDrink = false,
+    lastGrowth = nil,
+}
+
+local function getSavedCardData(savedName)
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local savedScreen = playerGui and playerGui:FindFirstChild("SavedCharactersScreenGui")
+    local root = savedScreen and savedScreen:FindFirstChild("CharactersFrame", true)
+    if not root then return nil, nil end
+
+    local matched = nil
+    for _, item in ipairs(root:GetDescendants()) do
+        local unique = item:GetAttribute("UniqueCharacterName")
+            or item:GetAttribute("CharacterName")
+        local textMatch = false
+        if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
+            textMatch = tostring(item.Text or ""):gsub("^%s*(.-)%s*$", "%1") == savedName
+        end
+        if unique == savedName or textMatch then
+            matched = item
+            break
+        end
+    end
+    if not matched then return nil, nil end
+
+    local species, growth
+    local function inspect(instance)
+        pcall(function()
+            local animal = instance:GetAttribute("AnimalName")
+            if type(animal) == "string" and animal ~= "" then species = species or animal end
+            local amount = instance:GetAttribute("GrowthPercentage")
+            if type(amount) == "number" then growth = growth or amount end
+            local value = instance:FindFirstChild("GrowthPercentage")
+            if value and (value:IsA("NumberValue") or value:IsA("IntValue")) then growth = growth or value.Value end
+            if instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox") then
+                local txt = tostring(instance.Text or ""):gsub("^%s*(.-)%s*$", "%1")
+                local found = txt:match("^[Mm]ale%s+(.+)$") or txt:match("^[Ff]emale%s+(.+)$")
+                if found and found ~= "" then species = species or found end
+                local percent = txt:match("(%d+%.?%d*)%s*%%")
+                if percent and txt:lower():find("growth", 1, true) then growth = growth or tonumber(percent) end
+            end
+        end)
+    end
+
+    -- Search each ancestor level: card layouts differ, so a fixed five-level climb can miss sibling labels.
+    local ancestor = matched
+    for _ = 1, 12 do
+        if not ancestor then break end
+        inspect(ancestor)
+        for _, item in ipairs(ancestor:GetDescendants()) do inspect(item) end
+        if species and growth ~= nil then break end
+        if ancestor == root then break end
+        ancestor = ancestor.Parent
+    end
+    return species, growth
+end
+
+local function getAnimalSpeciesForSavedName(savedName)
+    local species = getSavedCardData(savedName)
+    return species or "Unknown"
+end
+
+local function getSavedGrowthPercentage(savedName)
+    local _, growth = getSavedCardData(savedName)
+    return growth
+end
+
+local function isSavedAnimalComplete(savedName)
+    local growth = getSavedGrowthPercentage(savedName)
+    if growth == nil then return false end
+    -- UI text is already a percentage; attributes may be stored as 0-1 or 0-100.
+    if growth <= 1 then growth = growth * 100 end
+    return growth >= 99.9
+end
+
+local AutoGrowOptions, AutoGrowDisplayToName = {}, {}
+local AutoGrowRefreshing = false
+local AutoGrowDropdown
+local function refreshAutoGrowOptions()
+    AutoGrowOptions, AutoGrowDisplayToName = {}, {}
+    for _, savedName in ipairs(getSavedCharacterNames()) do
+        if not isSavedAnimalComplete(savedName) and not tostring(savedName):match("^#+$") then
+            local species, growth = getSavedCardData(savedName)
+            species = species or "Unknown"
+            if growth ~= nil and growth <= 1 then growth = growth * 100 end
+            local growthText = growth ~= nil and (tostring(math.floor(growth + 0.5)) .. "%") or "Growth unknown"
+            local display = savedName .. " | " .. species .. " | " .. growthText
+            AutoGrowOptions[#AutoGrowOptions + 1] = display
+            AutoGrowDisplayToName[display] = savedName
+        end
+    end
+    if AutoGrowDropdown then
+        AutoGrowRefreshing = true
+        pcall(function() AutoGrowDropdown:Refresh(AutoGrowOptions, true) end)
+        AutoGrowRefreshing = false
+    end
+end
+refreshAutoGrowOptions()
+
+AutoGrowDropdown = Tab:Dropdown({
+    Title = "Animals to Auto Grow",
+    Values = AutoGrowOptions,
+    Value = {},
+    Multi = true,
+    AllowNone = true,
+    SearchBarEnabled = true,
+    Callback = function(values)
+        if AutoGrowRefreshing or type(values) ~= "table" then return end
+        AutoGrow.queue = {}
+        for _, display in ipairs(values) do
+            local savedName = AutoGrowDisplayToName[display]
+            if savedName then
+                AutoGrow.queue[#AutoGrow.queue + 1] = { name = savedName, display = display }
+            end
+        end
+    end,
+})
+
+-- Refresh only when the saved-character menu adds/removes a slot; no polling loop.
+local autoGrowMenuConnections = {}
+local autoGrowRefreshQueued = false
+local function queueAutoGrowSlotRefresh()
+    if autoGrowRefreshQueued then return end
+    autoGrowRefreshQueued = true
+    task.delay(0.35, function()
+        autoGrowRefreshQueued = false
+        if not alive then return end
+        local ok, err = pcall(refreshAutoGrowOptions)
+        if not ok then warn("[Auto Grow] Slot refresh failed: " .. tostring(err)) end
+    end)
+end
+
+local function bindAutoGrowCharacterMenu()
+    for _, connection in ipairs(autoGrowMenuConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(autoGrowMenuConnections)
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local savedScreen = playerGui and playerGui:FindFirstChild("SavedCharactersScreenGui")
+    local root = savedScreen and savedScreen:FindFirstChild("CharactersFrame", true)
+    local scrolling = root and root:FindFirstChildWhichIsA("ScrollingFrame", true)
+    if not scrolling then return end
+    autoGrowMenuConnections[#autoGrowMenuConnections + 1] = scrolling.DescendantAdded:Connect(queueAutoGrowSlotRefresh)
+    autoGrowMenuConnections[#autoGrowMenuConnections + 1] = scrolling.ChildAdded:Connect(queueAutoGrowSlotRefresh)
+    autoGrowMenuConnections[#autoGrowMenuConnections + 1] = scrolling.ChildRemoved:Connect(queueAutoGrowSlotRefresh)
+end
+
+local playerGuiForAutoGrow = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+if playerGuiForAutoGrow then
+    local existingSavedScreen = playerGuiForAutoGrow:FindFirstChild("SavedCharactersScreenGui")
+    if existingSavedScreen then bindAutoGrowCharacterMenu() end
+    autoGrowMenuConnections[#autoGrowMenuConnections + 1] = playerGuiForAutoGrow.ChildAdded:Connect(function(child)
+        if child.Name == "SavedCharactersScreenGui" then
+            task.delay(0.25, bindAutoGrowCharacterMenu)
+        end
+    end)
+end
+
+local GrowthTrackerLabel = Tab:Paragraph({ Title = "Growth Tracker\nNo animals tracked." })
+local function refreshGrowthTracker()
+    local lines = {}
+    for _, entry in ipairs(AutoGrow.tracker) do lines[#lines + 1] = entry end
+    local content = #lines > 0 and table.concat(lines, "\n") or "No animals tracked."
+    pcall(function() GrowthTrackerLabel:SetTitle("Growth Tracker\n" .. content) end)
+end
+
+Tab:Button({ Title = "Clear Growth Tracker", Callback = function()
+    AutoGrow.tracker = {}
+    refreshGrowthTracker()
+end })
+
+local function pauseEatDrinkForGrowth()
+    AutoGrow.pausedEat = State.Eating
+    AutoGrow.pausedDrink = State.Drinking
+    State.Eating, State.Drinking = false, false
+    if State.Busy then
+        State.Cancel = true
+        stopHold()
+        task.spawn(stopFoodAction)
+        task.spawn(releaseWater)
+    end
+end
+
+local function resumeEatDrinkAfterSpawn()
+    State.Cancel = false
+    State.Eating = AutoGrow.pausedEat
+    State.Drinking = AutoGrow.pausedDrink
+    if State.Drinking and not State.Busy then task.spawn(runCycle, "Water", false) end
+    if State.Eating and not State.Busy then task.spawn(runCycle, "Food", false) end
+end
+
+local function spawnNextGrowthAnimal()
+    if not AutoGrow.on or AutoGrow.busy or #AutoGrow.queue == 0 then
+        AutoGrow.current = nil
+        return
+    end
+    AutoGrow.busy = true
+    AutoGrow.current = AutoGrow.queue[1]
+    pauseEatDrinkForGrowth()
+    task.spawn(function()
+        local target = AutoGrow.current
+        local resetRemote = RS:FindFirstChild("CustomCharacterResetRemoteFunction")
+            or RS:WaitForChild("CustomCharacterResetRemoteFunction", 5)
+        local previousCharacter = LocalPlayer.Character
+        local resetDeadline = tick() + 10
+
+        -- Retry reset every 2 seconds until the character changes or the retry window expires.
+        while alive and AutoGrow.on and tick() < resetDeadline do
+            if resetRemote and resetRemote:IsA("RemoteFunction") then
+                pcall(function() resetRemote:InvokeServer() end)
+            end
+            local changeDeadline = tick() + 2
+            while alive and AutoGrow.on and tick() < changeDeadline do
+                if LocalPlayer.Character ~= previousCharacter then break end
+                task.wait(0.1)
+            end
+            if LocalPlayer.Character ~= previousCharacter then break end
+        end
+
+        if not (alive and AutoGrow.on) then
+            AutoGrow.busy = false
+            return
+        end
+
+        -- Spawn an EXISTING saved character by its saved custom name.
+        -- Do not call any baby/new-character creation request from Auto Grow.
+        local spawnRemote = RS:FindFirstChild("SpawnAsCharacterRemoteFunction")
+            or RS:WaitForChild("SpawnAsCharacterRemoteFunction", 5)
+        local spawned = false
+        local spawnDeadline = tick() + 30
+        local lastSpawnAttempt = 0
+        while alive and AutoGrow.on and target and tick() < spawnDeadline do
+            if spawnRemote and spawnRemote:IsA("RemoteFunction") and tick() - lastSpawnAttempt >= 2 then
+                lastSpawnAttempt = tick()
+                local requestedName = tostring(target.name or "")
+                if requestedName ~= "" and not requestedName:match("^#+$") then
+                    warn("[Auto Grow] Requesting saved character: " .. requestedName)
+                    -- This is the exact existing-character call supplied by the user:
+                    -- SpawnAsCharacterRemoteFunction:InvokeServer("Velmaw")
+                    local ok, result = pcall(function()
+                        return spawnRemote:InvokeServer(requestedName)
+                    end)
+                    warn("[Auto Grow] Spawn remote returned | Name=" .. requestedName
+                        .. " | InvokeOK=" .. tostring(ok) .. " | Result=" .. tostring(result))
+                    if ok and result ~= false then
+                        local readyDeadline = tick() + 2
+                        while alive and AutoGrow.on and tick() < readyDeadline do
+                            local char = LocalPlayer.Character
+                            local animal = char and char:GetAttribute("AnimalName")
+                            local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+                            local rootPart = char and char:FindFirstChild("HumanoidRootPart")
+                            local unique = char and (char:GetAttribute("UniqueCharacterName")
+                                or char:GetAttribute("CharacterName"))
+                            local isRequestedCharacter = unique == requestedName
+                            if char and type(animal) == "string" and animal ~= ""
+                                and humanoid and humanoid.Health > 0 and rootPart
+                                and (isRequestedCharacter or unique == nil) then
+                                spawned = true
+                                break
+                            end
+                            task.wait(0.1)
+                        end
+                    end
+                else
+                    warn("[Auto Grow] Cannot spawn: saved name is empty or filtered in the menu: "
+                        .. tostring(requestedName))
+                    break
+                end
+            end
+            if spawned then break end
+            task.wait(0.1)
+        end
+
+        if not spawned then
+            notify("Auto Grow", "Could not spawn " .. tostring(target and target.name or "selected animal") .. ". Auto Grow will retry.")
+        end
+        AutoGrow.busy = false
+        if AutoGrow.on and spawned then
+            resumeEatDrinkAfterSpawn()
+        elseif AutoGrow.on then
+            task.delay(2, function()
+                if alive and AutoGrow.on and not AutoGrow.busy then spawnNextGrowthAnimal() end
+            end)
+        end
+    end)
+end
+
+Tab:Toggle({
+    Title = "Auto Grow",
+    Value = false,
+    Flag = "AutoGrowOn",
+    Callback = function(v)
+        AutoGrow.on = v
+        if v then
+            -- Turn on the actual WindUI controls so their visible switches match
+            -- the automation state. Set() invokes each toggle callback as well.
+            pcall(function() if EatToggle then EatToggle:Set(true) end end)
+            pcall(function() if DrinkToggle then DrinkToggle:Set(true) end end)
+
+            -- Keep both enabled after Auto Grow's temporary internal pause for reset/spawn.
+            State.Eating = true
+            State.Drinking = true
+            AutoGrow.pausedEat = true
+            AutoGrow.pausedDrink = true
+            if #AutoGrow.queue > 0 then spawnNextGrowthAnimal() end
+        else
+            AutoGrow.busy = false
+            AutoGrow.current = nil
+            resumeEatDrinkAfterSpawn()
+        end
+    end,
+})
+
+-- One lightweight growth check; no character scanning or per-frame work.
+task.spawn(function()
+    while alive do
+        task.wait(0.5)
+        if AutoGrow.on and AutoGrow.current and not AutoGrow.busy then
+            local char = LocalPlayer.Character
+            local growth = char and char:GetAttribute("GrowthPercentage")
+            if type(growth) == "number" then
+                local normalizedGrowth = growth > 1 and (growth / 100) or growth
+                local percent = math.floor(math.clamp(normalizedGrowth, 0, 1) * 100 + 0.5)
+                local current = AutoGrow.current
+                if percent >= 100 then
+                    AutoGrow.tracker[#AutoGrow.tracker + 1] = current.display .. " | Growth: Complete"
+                    refreshGrowthTracker()
+                    table.remove(AutoGrow.queue, 1)
+                    refreshAutoGrowOptions()
+                    AutoGrow.current = nil
+                    AutoGrow.busy = false
+                    spawnNextGrowthAnimal()
+                else
+                    local line = current.display .. " | Growth: " .. tostring(percent) .. "% | Ongoing"
+                    local last = AutoGrow.tracker[#AutoGrow.tracker]
+                    if last ~= line then
+                        if last and last:find(current.display, 1, true) and last:find("Ongoing", 1, true) then
+                            AutoGrow.tracker[#AutoGrow.tracker] = line
+                        else
+                            AutoGrow.tracker[#AutoGrow.tracker + 1] = line
+                        end
+                        refreshGrowthTracker()
+                    end
+                end
+            end
+        end
+    end
+end)
+end)()
+
+Tab:Section({ Title = "Auto Spawn" })
 
 local AutoSpawnNames = getSavedCharacterNames()
 if not table.find(AutoSpawnNames, AutoSpawn.character) then AutoSpawn.character = AutoSpawnNames[1] end
@@ -3541,6 +5083,20 @@ task.spawn(function()
     end
 end)
 
+-- ================= TAB: FPS =================
+local FPSTab = Window:Tab({ Title = "FPS", Icon = "gauge" })
+hook(FPSTab)
+
+FPSTab:Section({ Title = "Rain Control" })
+FPSTab:Toggle({
+    Title = "Anti-Rain",
+    Value = Config.AntiRainEnabled,
+    Flag = "AntiRainEnabled",
+    Callback = function(v)
+        Config.AntiRainEnabled = v
+    end,
+})
+
 -- ================= TAB 4: CONFIG =================
 local ConfigTab = Window:Tab({ Title = "Config", Icon = "user" })
 hook(ConfigTab)
@@ -3660,11 +5216,11 @@ local SettingsTab = Window:Tab({ Title = "Settings", Icon = "settings" })
 hook(SettingsTab)
 
 -- ================= TAB 3: MENU (minimize key) =================
+local WindowOpen = true
 local MenuTab = Window:Tab({ Title = "Menu", Icon = "menu" })
 hook(MenuTab)
 
 -- open / close the window using the minimize key
-local WindowOpen = true
 local function toggleWindow()
     local ok = pcall(function() Window:Toggle() end)
     if not ok then
@@ -3675,6 +5231,7 @@ local function toggleWindow()
         end
     end
     WindowOpen = not WindowOpen
+    if setQuickOverlayVisible then setQuickOverlayVisible(WindowOpen) end
 end
 
 -- ---- minimize key (default Right Alt) ----
@@ -3694,6 +5251,50 @@ applyConfigMinKey = function(name) return setMinKey(name) end
 
 MinKeyLabel = MenuTab:Paragraph({ Title = "Minimize key: RightAlt" })
 
+MenuTab:Dropdown({
+    Title = "Hide Quick Binds",
+    Values = {
+        "Kill Aura",
+        "Hitbox Expander",
+        "Auto Special Attack",
+        "Walkspeed",
+        "Fly",
+        "Noclip",
+        "ESP",
+    },
+    Value = {},
+    Multi = true,
+    AllowNone = true,
+    SearchBarEnabled = true,
+    Flag = "QuickBindHidden",
+    Callback = function(options)
+        local selected = {}
+        local saved = {}
+        if type(options) == "table" then
+            for key, option in pairs(options) do
+                local name
+                if type(option) == "string" then
+                    name = option
+                elseif type(option) == "table" then
+                    name = option.Title or option.Name or option.Value or option.value
+                elseif option == true and type(key) == "string" then
+                    name = key
+                end
+                if type(name) == "string" then
+                    selected[name] = true
+                end
+            end
+        end
+        for name in pairs(selected) do
+            saved[#saved + 1] = name
+        end
+        table.sort(saved)
+        QuickBindHidden = selected
+        Values.QuickBindHidden = saved
+        if applyQuickBindVisibility then applyQuickBindVisibility() end
+    end,
+})
+
 MenuTab:Button({
     Title = "Change Minimize Key (then press a key)",
     Callback = function()
@@ -3706,6 +5307,7 @@ MenuTab:Button({
 
 local keyConn = UIS.InputBegan:Connect(function(input, gp)
     if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    if QuickBindCapturing then return end
     if capturingKey then
         capturingKey = false
         if input.KeyCode == Enum.KeyCode.Escape then
@@ -3800,14 +5402,6 @@ SettingsTab:Slider({
     Callback = function(v) Config.PlaneShoreOffset = v end,
 })
 
-SettingsTab:Slider({
-    Title = "How Far Across The Map Auto Drink Looks For Water (studs)",
-    Step = 100,
-    Value = { Min = 200, Max = 4000, Default = Config.WaterSearchDistance },
-    Flag = "WaterSearchDistance",
-    Callback = function(v) Config.WaterSearchDistance = v end,
-})
-
 SettingsTab:Button({
     Title = "Unstick: Go To Nearest Shore (use if you're stuck in water / under the map)",
     Callback = function() task.spawn(rescueToShore) end,
@@ -3861,54 +5455,28 @@ SettingsTab:Button({
     end,
 })
 
-local Fly = { on = false, speed = 8, forceRoot = nil, attachment = nil, hoverForce = nil }
-local flyConn
-
-local function clearFlyHover()
-    if Fly.hoverForce then pcall(function() Fly.hoverForce:Destroy() end) end
-    if Fly.attachment then pcall(function() Fly.attachment:Destroy() end) end
-    Fly.forceRoot, Fly.attachment, Fly.hoverForce = nil, nil, nil
-end
-
-local function keepFlyHover(root)
-    if Fly.forceRoot ~= root or not Fly.hoverForce or not Fly.attachment then
-        clearFlyHover()
-        local attachment = Instance.new("Attachment")
-        attachment.Name = "AnimalFarmFlyAttachment"
-        attachment.Parent = root
-
-        local force = Instance.new("VectorForce")
-        force.Name = "AnimalFarmFlyHoverForce"
-        force.Attachment0 = attachment
-        force.RelativeTo = Enum.ActuatorRelativeTo.World
-        force.ApplyAtCenterOfMass = true
-        force.Parent = root
-
-        Fly.forceRoot, Fly.attachment, Fly.hoverForce = root, attachment, force
-    end
-
-    -- Counter gravity so releasing movement keys holds altitude instead of slowly sinking.
-    Fly.hoverForce.Force = Vector3.new(0, root.AssemblyMass * workspace.Gravity, 0)
-end
+-- ================= FLY CONTROLLER =================
+-- This is the only flight implementation. It has no legacy hover-force,
+-- attachment, or secondary flight loop to compete with the selected mode.
+local FlyController = { connection = nil }
 
 local function stopFly()
-    Fly.on = false
-    if flyConn then flyConn:Disconnect() flyConn = nil end
-    clearFlyHover()
+    Config.FlyEnabled = false
+    if FlyController.connection then
+        FlyController.connection:Disconnect()
+        FlyController.connection = nil
+    end
 end
 
 local function startFly()
-    if Fly.on then return end
-    Fly.on = true
-    flyConn = RunService.Heartbeat:Connect(function(dt)
-        if not Fly.on then return end
+    if FlyController.connection then return end
+    Config.FlyEnabled = true
+    FlyController.connection = RunService.Heartbeat:Connect(function(dt)
+        if not Config.FlyEnabled then return end
+
         local root = getRoot()
         local camera = workspace.CurrentCamera
-        if not root or not camera then
-            clearFlyHover()
-            return
-        end
-        keepFlyHover(root)
+        if not root or not camera then return end
 
         local direction = Vector3.zero
         if not UIS:GetFocusedTextBox() then
@@ -3919,14 +5487,32 @@ local function startFly()
             if UIS:IsKeyDown(Enum.KeyCode.Space) then direction += Vector3.yAxis end
             if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then direction -= Vector3.yAxis end
         end
-        if direction.Magnitude > 0 then
-            root.CFrame = root.CFrame + direction.Unit * Fly.speed * math.min(dt, 0.1)
+
+        local speed = math.clamp(tonumber(Config.FlySpeed) or 10, 10, 200)
+        if Config.FlyMode == "Velocity" then
+            -- Physics-based movement. Zero velocity while idle keeps the character airborne.
+            root.AssemblyLinearVelocity = direction.Magnitude > 0
+                and direction.Unit * speed or Vector3.zero
+        else
+            -- Direct CFrame movement; does not use the Velocity mode's movement path.
+            if direction.Magnitude > 0 then
+                root.CFrame = root.CFrame + direction.Unit * speed * math.min(dt, 0.1)
+            end
+            root.AssemblyLinearVelocity = Vector3.zero
         end
-        root.AssemblyLinearVelocity = Vector3.zero
     end)
 end
 
-local WalkspeedModifier = { on = false, value = 16, humanoid = nil, original = nil, walkConn = nil, charConn = nil }
+local function setFlyEnabled(enabled)
+    Config.FlyEnabled = enabled == true
+    if Config.FlyEnabled then
+        startFly()
+    else
+        stopFly()
+    end
+end
+
+local WalkspeedModifier = { on = false, value = 16, mode = "Walkspeed", humanoid = nil, original = nil, walkConn = nil, charConn = nil, velocityConn = nil }
 
 local function disconnectWalkspeedHumanoid(restore)
     if WalkspeedModifier.walkConn then WalkspeedModifier.walkConn:Disconnect(); WalkspeedModifier.walkConn = nil end
@@ -3954,24 +5540,61 @@ local function bindWalkspeedHumanoid(character)
 end
 
 local function setWalkspeedModifier(enabled)
+    if WalkspeedModifier.velocityConn then
+        WalkspeedModifier.velocityConn:Disconnect()
+        WalkspeedModifier.velocityConn = nil
+    end
+    if WalkspeedModifier.charConn then
+        WalkspeedModifier.charConn:Disconnect()
+        WalkspeedModifier.charConn = nil
+    end
+    disconnectWalkspeedHumanoid(true)
     WalkspeedModifier.on = enabled
-    if enabled then
-        if WalkspeedModifier.charConn then WalkspeedModifier.charConn:Disconnect() end
+    if not enabled then return end
+
+    if WalkspeedModifier.mode == "Velocity" then
+        WalkspeedModifier.velocityConn = RunService.Heartbeat:Connect(function()
+            if not WalkspeedModifier.on or WalkspeedModifier.mode ~= "Velocity" then return end
+            local character = LocalPlayer.Character
+            local humanoid = character and character:FindFirstChildWhichIsA("Humanoid")
+            local root = getRoot()
+            if not (humanoid and root) then return end
+            local direction = humanoid.MoveDirection
+            local current = root.AssemblyLinearVelocity
+            if direction.Magnitude > 0 then
+                local horizontal = direction.Unit * WalkspeedModifier.value
+                root.AssemblyLinearVelocity = Vector3.new(horizontal.X, current.Y, horizontal.Z)
+            else
+                root.AssemblyLinearVelocity = Vector3.new(0, current.Y, 0)
+            end
+        end)
+    else
         WalkspeedModifier.charConn = LocalPlayer.CharacterAdded:Connect(function(character)
             task.defer(bindWalkspeedHumanoid, character)
         end)
         bindWalkspeedHumanoid(LocalPlayer.Character)
-    else
-        if WalkspeedModifier.charConn then WalkspeedModifier.charConn:Disconnect(); WalkspeedModifier.charConn = nil end
-        disconnectWalkspeedHumanoid(true)
     end
 end
 
 MovementTab:Toggle({
-    Title = "Walkspeed Modifier",
+    Title = "Walkspeed Enabled",
     Value = false,
     Flag = "WalkspeedOn",
     Callback = function(value) setWalkspeedModifier(value) end,
+})
+
+MovementTab:Dropdown({
+    Title = "Walkspeed Mode",
+    Values = { "Walkspeed", "Velocity" },
+    Value = WalkspeedModifier.mode,
+    Flag = "WalkspeedMode",
+    Callback = function(value)
+        local selected = type(value) == "table" and (value.Title or value.Name or value[1]) or value
+        if selected == "Walkspeed" or selected == "Velocity" then
+            WalkspeedModifier.mode = selected
+            if WalkspeedModifier.on then setWalkspeedModifier(true) end
+        end
+    end,
 })
 
 MovementTab:Slider({
@@ -3987,19 +5610,35 @@ MovementTab:Slider({
     end,
 })
 
+-- Fly controls: Velocity and CFrame remain separate movement implementations.
 MovementTab:Toggle({
-    Title = "Fly",
+    Title = "Fly Enabled",
     Value = false,
     Flag = "FlyOn",
-    Callback = function(v) if v then startFly() else stopFly() end end,
+    Callback = function(v) setFlyEnabled(v) end,
+})
+
+MovementTab:Dropdown({
+    Title = "Fly Mode",
+    Values = { "Velocity", "CFrame" },
+    Value = Config.FlyMode,
+    Flag = "FlyMode",
+    Callback = function(value)
+        local selected = type(value) == "table" and (value.Title or value.Name or value[1]) or value
+        if selected == "Velocity" or selected == "CFrame" then
+            Config.FlyMode = selected
+        end
+    end,
 })
 
 MovementTab:Slider({
     Title = "Fly Speed",
     Step = 1,
-    Value = { Min = 1, Max = 30, Default = Fly.speed },
+    Value = { Min = 10, Max = 200, Default = Config.FlySpeed },
     Flag = "FlySpeed",
-    Callback = function(v) Fly.speed = math.clamp(v, 1, 30) end,
+    Callback = function(v)
+        Config.FlySpeed = math.clamp(tonumber(v) or 10, 10, 200)
+    end,
 })
 
 MovementTab:Toggle({
@@ -4008,6 +5647,281 @@ MovementTab:Toggle({
     Flag = "MovementNoclip",
     Callback = function(v) State.MovementNoclip = v refreshNoclip() end,
 })
+
+MovementTab:Toggle({
+    Title = "Waterwalk",
+    Value = Config.WaterWalkEnabled,
+    Flag = "WaterWalkEnabled",
+    Callback = function(v) Config.WaterWalkEnabled = v == true end,
+})
+
+local _waterWalkActive = false
+local waterWalkConn = RunService.Stepped:Connect(function()
+    if Config.WaterWalkEnabled then
+        if not _waterWalkActive then
+            local waterPart = workspace:FindFirstChild("MainWaterPart")
+            if waterPart then
+                waterPart.CanCollide = true
+                _waterWalkActive = true
+            end
+        end
+    elseif _waterWalkActive then
+        local waterPart = workspace:FindFirstChild("MainWaterPart")
+        if waterPart then waterPart.CanCollide = false end
+        _waterWalkActive = false
+    end
+end)
+
+-- Separate quick-bind overlay. It follows the main window's visibility.
+local function setupQuickBindOverlay()
+    local TweenService = game:GetService("TweenService")
+    local quickGui = Instance.new("ScreenGui")
+    quickGui.Name = "StimmyQuickBinds"
+    quickGui.ResetOnSpawn = false
+    quickGui.IgnoreGuiInset = true
+    quickGui.DisplayOrder = 10001
+    quickGui.Enabled = true
+    local quickParent = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if type(gethui) == "function" then
+        local ok, hui = pcall(gethui)
+        if ok and hui then quickParent = hui end
+    end
+    quickGui.Parent = quickParent
+
+    local panel = Instance.new("Frame")
+    panel.Name = "QuickBinds"
+    panel.AnchorPoint = Vector2.new(1, 0.5)
+    panel.Position = UDim2.new(1, 12, 0.5, 0)
+    panel.Size = UDim2.fromOffset(205, 296)
+    panel.BackgroundColor3 = Color3.fromRGB(18, 18, 20)
+    panel.BackgroundTransparency = 0.08
+    panel.BorderSizePixel = 0
+    panel.Parent = quickGui
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = panel
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(65, 65, 70)
+    stroke.Transparency = 0.2
+    stroke.Parent = panel
+
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.fromOffset(13, 9)
+    title.Size = UDim2.new(1, -26, 0, 26)
+    title.Font = Enum.Font.GothamSemibold
+    title.Text = "Quick Binds"
+    title.TextColor3 = Color3.fromRGB(245, 245, 247)
+    title.TextSize = 14
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = panel
+
+    local bindRows = {
+        { key = "KillAura", label = "Kill Aura" },
+        { key = "Hitbox", label = "Hitbox Expander" },
+        { key = "AutoSpecial", label = "Auto Special Attack" },
+        { key = "Walkspeed", label = "Walkspeed" },
+        { key = "Fly", label = "Fly" },
+        { key = "Noclip", label = "Noclip" },
+        { key = "ESP", label = "ESP" },
+    }
+    local QuickBindRowFrames = {}
+    local quickBindFlags = {
+        KillAura = "KillAuraOn",
+        Hitbox = "HitboxOn",
+        AutoSpecial = "AutoSpecialAttackOn",
+        Walkspeed = "WalkspeedOn",
+        Fly = "FlyOn",
+        Noclip = "MovementNoclip",
+        ESP = "ESPOn",
+    }
+    local function toggleQuickBindFeature(bind)
+        local flag = quickBindFlags[bind]
+        local element = flag and Elements[flag]
+        if element and element.el then
+            pcall(function()
+                element.el:Set(Values[flag] ~= true)
+            end)
+        end
+    end
+    local captureKey
+    local function refreshBindButton(bind)
+        local button = QuickBindButtons[bind]
+        if button then
+            local code = QuickBindCodes[bind]
+            button.Text = code and ("[" .. code.Name .. "]") or "[--]"
+        end
+    end
+    local function updateQuickBind(bind, keyCode)
+        QuickBindCodes[bind] = keyCode
+        Values["QuickBind_" .. bind] = keyCode and keyCode.Name or ""
+        refreshBindButton(bind)
+    end
+    applyConfigQuickBind = function(bind, name)
+        if not QuickBindCodes[bind] then return false end
+        if name == "" or name == nil then
+            updateQuickBind(bind, nil)
+            return true
+        end
+        local ok, keyCode = pcall(function() return Enum.KeyCode[name] end)
+        if not (ok and keyCode and keyCode ~= Enum.KeyCode.Unknown) then return false end
+        updateQuickBind(bind, keyCode)
+        return true
+    end
+
+    for index, bind in ipairs(bindRows) do
+        local row = Instance.new("Frame")
+        row.BackgroundColor3 = Color3.fromRGB(37, 37, 40)
+        row.BorderSizePixel = 0
+        row.Position = UDim2.fromOffset(9, 41 + (index - 1) * 35)
+        row.Size = UDim2.new(1, -18, 0, 30)
+        row.Parent = panel
+        QuickBindRowFrames[bind.key] = row
+        local rowCorner = Instance.new("UICorner")
+        rowCorner.CornerRadius = UDim.new(0, 6)
+        rowCorner.Parent = row
+
+        local name = Instance.new("TextButton")
+        name.AutoButtonColor = false
+        name.BackgroundTransparency = 1
+        name.Position = UDim2.fromOffset(0, 0)
+        name.Size = UDim2.new(1, -72, 1, 0)
+        name.Font = Enum.Font.Gotham
+        name.Text = bind.label
+        name.TextColor3 = Color3.fromRGB(235, 235, 238)
+        name.TextSize = 12
+        name.TextXAlignment = Enum.TextXAlignment.Left
+        name.Parent = row
+        name.MouseButton1Click:Connect(function()
+            toggleQuickBindFeature(bind.key)
+        end)
+
+        local button = Instance.new("TextButton")
+        button.AutoButtonColor = true
+        button.BackgroundColor3 = Color3.fromRGB(54, 54, 58)
+        button.BorderSizePixel = 0
+        button.Position = UDim2.new(1, -63, 0, 3)
+        button.Size = UDim2.new(0, 55, 1, -6)
+        button.Font = Enum.Font.GothamSemibold
+        button.TextColor3 = Color3.fromRGB(245, 245, 247)
+        button.TextSize = 11
+        button.Parent = row
+        local buttonCorner = Instance.new("UICorner")
+        buttonCorner.CornerRadius = UDim.new(0, 5)
+        buttonCorner.Parent = button
+        QuickBindButtons[bind.key] = button
+        refreshBindButton(bind.key)
+        button.MouseButton1Click:Connect(function()
+            captureKey = bind.key
+            QuickBindCapturing = true
+            button.Text = "Press..."
+        end)
+        button.MouseButton2Click:Connect(function()
+            captureKey = nil
+            QuickBindCapturing = false
+            updateQuickBind(bind.key, nil)
+        end)
+    end
+
+    applyQuickBindVisibility = function()
+        local visibleIndex = 0
+        for _, bind in ipairs(bindRows) do
+            local row = QuickBindRowFrames[bind.key]
+            if row then
+                local hidden = QuickBindHidden[bind.label] == true
+                row.Visible = not hidden
+                if not hidden then
+                    row.Position = UDim2.fromOffset(9, 41 + visibleIndex * 35)
+                    visibleIndex = visibleIndex + 1
+                end
+            end
+        end
+        panel.Size = UDim2.fromOffset(205, math.max(58, 51 + visibleIndex * 35))
+    end
+    applyQuickBindVisibility()
+
+    task.spawn(function()
+        while alive and quickGui.Parent do
+            for bind, flag in pairs(quickBindFlags) do
+                local active = Values[flag] == true
+                local row = QuickBindRowFrames[bind]
+                local button = QuickBindButtons[bind]
+                if row then
+                    row.BackgroundColor3 = active
+                        and Color3.fromRGB(35, 94, 55)
+                        or Color3.fromRGB(37, 37, 40)
+                end
+                if button then
+                    button.BackgroundColor3 = active
+                        and Color3.fromRGB(43, 145, 72)
+                        or Color3.fromRGB(54, 54, 58)
+                end
+            end
+            task.wait(0.12)
+        end
+    end)
+
+    local shownPosition = UDim2.new(1, -12, 0.5, 0)
+    local hiddenPosition = UDim2.new(1, 220, 0.5, 0)
+    local visibilityTween
+    setQuickOverlayVisible = function(visible)
+        if visibilityTween then pcall(function() visibilityTween:Cancel() end) end
+        if visible then quickGui.Enabled = true end
+        visibilityTween = TweenService:Create(panel, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Position = visible and shownPosition or hiddenPosition,
+        })
+        visibilityTween:Play()
+        if not visible then
+            local currentTween = visibilityTween
+            currentTween.Completed:Once(function()
+                if not WindowOpen then quickGui.Enabled = false end
+            end)
+        end
+    end
+    setQuickOverlayVisible(WindowOpen)
+
+    UIS.InputBegan:Connect(function(input, gameProcessed)
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        if captureKey then
+            local bind = captureKey
+            captureKey = nil
+            QuickBindCapturing = false
+            if input.KeyCode == Enum.KeyCode.Escape then
+                refreshBindButton(bind)
+            elseif input.KeyCode ~= Enum.KeyCode.Unknown then
+                updateQuickBind(bind, input.KeyCode)
+            end
+            return
+        end
+        if gameProcessed then return end
+        local bindToFlag = {
+            KillAura = "KillAuraOn",
+            Hitbox = "HitboxOn",
+            AutoSpecial = "AutoSpecialAttackOn",
+            Walkspeed = "WalkspeedOn",
+            Fly = "FlyOn",
+            Noclip = "MovementNoclip",
+            ESP = "ESPOn",
+        }
+        for bind, flag in pairs(bindToFlag) do
+            if QuickBindCodes[bind] and input.KeyCode == QuickBindCodes[bind] then
+                local element = Elements[flag]
+                if element then pcall(function() element.el:Set(not Values[flag]) end) end
+                return
+            end
+        end
+    end)
+
+    Window:OnClose(function()
+        WindowOpen = false
+        setQuickOverlayVisible(false)
+    end)
+    Window:OnOpen(function()
+        WindowOpen = true
+        setQuickOverlayVisible(true)
+    end)
+end
+setupQuickBindOverlay()
 
 SettingsTab:Section({ Title = "Movement" })
 
@@ -4098,6 +6012,8 @@ SettingsTab:Button({
     end,
 })
 
+
+
 -- open the first tab
 pcall(function() Window:SelectTab(1) end)
 
@@ -4127,9 +6043,13 @@ end)
 -- ================= CLEANUP (for re-running the script) =================
 env.AnimalFarmStop = function()
     pcall(saveServerSafeLists)
+    env.StimmyHubNoFallDamageEnabled = false
     alive = false
     State.Cancel = true
     if afkConn then afkConn:Disconnect() end
+    if weatherTerrainChildConn then weatherTerrainChildConn:Disconnect() end
+    if weatherWorkspaceChildConn then weatherWorkspaceChildConn:Disconnect() end
+    if weatherRenderConn then weatherRenderConn:Disconnect() end
     if keyConn then keyConn:Disconnect() end
     if HitboxCleanup then pcall(HitboxCleanup) end
     if VisualsCleanup then pcall(VisualsCleanup) end
@@ -4137,8 +6057,16 @@ env.AnimalFarmStop = function()
     setNoclip(false)
     stopFly()
     setWalkspeedModifier(false)
+    Config.WaterWalkEnabled = false
+    if waterWalkConn then waterWalkConn:Disconnect() waterWalkConn = nil end
+    if _waterWalkActive then
+        local waterPart = workspace:FindFirstChild("MainWaterPart")
+        if waterPart then waterPart.CanCollide = false end
+        _waterWalkActive = false
+    end
     if noclipConn then noclipConn:Disconnect() end
     if noclipDescendantConn then noclipDescendantConn:Disconnect() end
     if noclipCharacterConn then noclipCharacterConn:Disconnect() end
     pcall(function() Window:Destroy() end)
+    if env.StimmyAnimalDiagGui then pcall(function() env.StimmyAnimalDiagGui:Destroy() end); env.StimmyAnimalDiagGui = nil end
 end
