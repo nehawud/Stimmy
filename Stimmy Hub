@@ -2791,6 +2791,73 @@ do
         CobraRecorder.events[#CobraRecorder.events + 1] = string.format("[+%.3fs] %s", elapsed, tostring(message))
     end
 
+    -- Temporarily trace every exported Hitboxes API function during the 5-second Cobra scan.
+    -- Wrappers preserve all arguments, return values, and errors; originals are restored afterward.
+    local function installCobraApiTrace()
+        local H = Hitboxes
+        if type(H) ~= "table" then return function() end end
+        local originals = {}
+        local unpackValues = table.unpack or unpack
+        local function packValues(...)
+            return { n = select("#", ...), ... }
+        end
+        local function describe(value)
+            if typeof(value) == "Instance" then
+                if value:IsA("Model") then
+                    return "Model(" .. cobraAnimalName(value) .. ":" .. value.Name .. ")"
+                end
+                return value.ClassName .. "(" .. value.Name .. ")"
+            end
+            local kind = type(value)
+            if kind == "table" then return "table" end
+            if kind == "string" then return string.sub(value, 1, 48) end
+            return tostring(value)
+        end
+        for key, original in pairs(H) do
+            if type(key) == "string" and type(original) == "function" then
+                originals[key] = original
+                H[key] = function(...)
+                    local args = packValues(...)
+                    local isCobraCall, argDescriptions = false, {}
+                    for index = 1, args.n do
+                        local value = args[index]
+                        argDescriptions[#argDescriptions + 1] = tostring(index) .. "=" .. describe(value)
+                        if isCobraCharacter(value) then isCobraCall = true end
+                    end
+                    local relevantName = string.find(string.lower(key), "hit", 1, true)
+                        or string.find(string.lower(key), "reach", 1, true)
+                        or string.find(string.lower(key), "attack", 1, true)
+                        or string.find(string.lower(key), "definition", 1, true)
+                        or string.find(string.lower(key), "cobra", 1, true)
+                    local results = packValues(pcall(original, unpackValues(args, 1, args.n)))
+                    if isCobraCall or relevantName then
+                        if results[1] then
+                            local returned = {}
+                            for index = 2, math.min(results.n, 5) do
+                                returned[#returned + 1] = tostring(index - 1) .. "=" .. describe(results[index])
+                            end
+                            recordCobraEvent("API " .. key .. "(" .. table.concat(argDescriptions, ",")
+                                .. ") -> " .. table.concat(returned, ","))
+                        else
+                            recordCobraEvent("API " .. key .. " ERROR: " .. tostring(results[2]))
+                        end
+                    end
+                    if not results[1] then error(results[2], 0) end
+                    return unpackValues(results, 2, results.n)
+                end
+            end
+        end
+        return function()
+            for key, original in pairs(originals) do
+                if type(H[key]) == "function" then
+                    -- Restore only if our tracing wrapper is still installed.
+                    local current = H[key]
+                    if current ~= original then H[key] = original end
+                end
+            end
+        end
+    end
+
     local function isCobraCharacter(char)
         return typeof(char) == "Instance" and char:IsA("Model")
             and string.lower(cobraAnimalName(char)):find("cobra", 1, true) ~= nil
@@ -3242,6 +3309,7 @@ do
             CobraRecorder.events = {}
             CobraRecorder.started = tick()
             CobraRecorder.active = true
+            local restoreApiTrace = installCobraApiTrace()
             recordCobraEvent("START; HitboxEnabled=" .. tostring(Hit.on)
                 .. "; ClosestPriority=" .. tostring(Hit.priorityClosest)
                 .. "; Multiplier=" .. tostring(Hit.mult))
@@ -3282,6 +3350,7 @@ do
                 end
 
                 CobraRecorder.active = false
+                pcall(restoreApiTrace)
                 local lines = {
                     "=== STIMMY 5-SECOND COBRA ATTACK RECORDING ===",
                     "Hitbox Expander: " .. tostring(Hit.on),
