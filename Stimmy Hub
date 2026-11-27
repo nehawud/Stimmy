@@ -2760,6 +2760,25 @@ do
     }
     local Hitboxes, origGetDefs, origGetReach = nil, nil, nil
     local ScaledCache = setmetatable({}, { __mode = "k" }) -- [original definitions] = { mult, list }
+    local CobraRecorder = { active = false, started = 0, events = {}, maxEvents = 180 }
+
+    local function cobraAnimalName(char)
+        if not char then return "?" end
+        local ok, value = pcall(function() return char:GetAttribute("AnimalName") end)
+        if ok and type(value) == "string" and value ~= "" then return value end
+        return char.Name
+    end
+
+    local function recordCobraEvent(message)
+        if not CobraRecorder.active or #CobraRecorder.events >= CobraRecorder.maxEvents then return end
+        local elapsed = tick() - CobraRecorder.started
+        CobraRecorder.events[#CobraRecorder.events + 1] = string.format("[+%.3fs] %s", elapsed, tostring(message))
+    end
+
+    local function isCobraCharacter(char)
+        return typeof(char) == "Instance" and char:IsA("Model")
+            and string.lower(cobraAnimalName(char)):find("cobra", 1, true) ~= nil
+    end
 
     -- Hitbox and aura safe lists are declared above for additive sync.
 
@@ -2837,18 +2856,38 @@ do
         return pcall(function()
             H.GetDefinitions = function(char, ...)
                 local defs = gd(char, ...)
-                if Hit.on and Hit.mult > 1 and type(defs) == "table" and typeof(char) == "Instance"
-                    and char ~= LocalPlayer.Character and not isHitSafe(char) then
-                    return scaledDefs(defs)
+                local shouldScale = Hit.on and Hit.mult > 1 and type(defs) == "table"
+                    and typeof(char) == "Instance" and char ~= LocalPlayer.Character and not isHitSafe(char)
+                local result = shouldScale and scaledDefs(defs) or defs
+                if isCobraCharacter(char) then
+                    local function sizes(list)
+                        local out = {}
+                        if type(list) == "table" then
+                            for i, def in ipairs(list) do
+                                out[#out + 1] = tostring(i) .. ":" .. tostring(def.Size)
+                                    .. "/anchor=" .. tostring(def.AnchorRadius)
+                            end
+                        end
+                        return #out > 0 and table.concat(out, "; ") or "(none)"
+                    end
+                    recordCobraEvent("GetDefinitions called; enabled=" .. tostring(Hit.on)
+                        .. " mult=" .. tostring(Hit.mult) .. " safe=" .. tostring(isHitSafe(char))
+                        .. " preferred=" .. tostring(getPreferredHitTarget() == char)
+                        .. " original={" .. sizes(defs) .. "} returned={" .. sizes(result) .. "}")
                 end
-                return defs
+                return result
             end
             H.GetReach = function(char, ...)
                 local r = gr(char, ...)
-                if r and isPreferredHitTarget(char) then
-                    return r * Hit.mult
+                local preferred = isPreferredHitTarget(char)
+                local result = (r and preferred) and (r * Hit.mult) or r
+                if isCobraCharacter(char) then
+                    recordCobraEvent("GetReach called; enabled=" .. tostring(Hit.on)
+                        .. " closestPriority=" .. tostring(Hit.priorityClosest)
+                        .. " preferred=" .. tostring(preferred) .. " original=" .. tostring(r)
+                        .. " returned=" .. tostring(result))
                 end
-                return r
+                return result
             end
         end)
     end
@@ -3172,6 +3211,71 @@ do
                 if not ok then
                     warn("[Stimmy] Hitbox diagnostics failed: " .. tostring(err))
                     notify("Hitbox diagnostics", "Scan failed: " .. tostring(err))
+                end
+            end)
+        end,
+    })
+
+    CombatTab:Button({
+        Title = "Record Cobra Attack Scan (5s)",
+        Callback = function()
+            if CobraRecorder.active then
+                notify("Cobra recorder", "A scan is already running.")
+                return
+            end
+            CobraRecorder.events = {}
+            CobraRecorder.started = tick()
+            CobraRecorder.active = true
+            recordCobraEvent("START; HitboxEnabled=" .. tostring(Hit.on)
+                .. "; ClosestPriority=" .. tostring(Hit.priorityClosest)
+                .. "; Multiplier=" .. tostring(Hit.mult))
+            notify("Cobra recorder", "Recording for 5 seconds. Attack the Cobra now!")
+
+            task.spawn(function()
+                local finishAt = CobraRecorder.started + 5
+                while alive and CobraRecorder.active and tick() < finishAt do
+                    local localChar = LocalPlayer.Character
+                    local localRoot = localChar and localChar:FindFirstChild("HumanoidRootPart")
+                    local closest = getPreferredHitTarget()
+                    for _, player in ipairs(Players:GetPlayers()) do
+                        if player ~= LocalPlayer and isCobraCharacter(player.Character) then
+                            local target = player.Character
+                            local root = target:FindFirstChild("HumanoidRootPart")
+                            local hum = target:FindFirstChildOfClass("Humanoid")
+                            local distance = (localRoot and root) and (root.Position - localRoot.Position).Magnitude or nil
+                            recordCobraEvent("SAMPLE player=" .. player.Name
+                                .. " distance=" .. tostring(distance)
+                                .. " closest=" .. tostring(closest == target)
+                                .. " safe=" .. tostring(HitSafe[player.Name] == true)
+                                .. " health=" .. tostring(hum and hum.Health)
+                                .. " localAnimal=" .. cobraAnimalName(localChar))
+                        end
+                    end
+                    task.wait(0.1)
+                end
+
+                CobraRecorder.active = false
+                local lines = {
+                    "=== STIMMY 5-SECOND COBRA ATTACK RECORDING ===",
+                    "Hitbox Expander: " .. tostring(Hit.on),
+                    "Closest priority: " .. tostring(Hit.priorityClosest),
+                    "Multiplier: " .. tostring(Hit.mult),
+                    "Events captured: " .. tostring(#CobraRecorder.events),
+                }
+                for _, event in ipairs(CobraRecorder.events) do
+                    lines[#lines + 1] = event
+                end
+                if #CobraRecorder.events == 0 then
+                    lines[#lines + 1] = "No Cobra player samples or Hitboxes API calls captured."
+                end
+                lines[#lines + 1] = "=== END RECORDING ==="
+                local report = table.concat(lines, "\\n")
+                print(report)
+                if setclipboard then
+                    pcall(setclipboard, report)
+                    notify("Cobra recorder", "5-second scan complete. Report copied to clipboard.")
+                else
+                    notify("Cobra recorder", "5-second scan complete. Report printed to console.")
                 end
             end)
         end,
