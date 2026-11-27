@@ -3287,6 +3287,8 @@ do
         local previousCopyExists = copiesExists
         local previousCopyEntries = copiesInitial
         local function copyEntriesChanged(previous, current)
+            previous = type(previous) == "table" and previous or {}
+            current = type(current) == "table" and current or {}
             if #previous ~= #current then return true end
             for index, entry in ipairs(current) do
                 if previous[index] ~= entry then return true end
