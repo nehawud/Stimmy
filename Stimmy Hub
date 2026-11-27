@@ -3084,196 +3084,177 @@ do
         end,
     })
 
-    local function runHitboxDiagnostics()
-        local lines = {}
-        local function log(s)
-            lines[#lines + 1] = tostring(s)
-        end
-        local character = LocalPlayer.Character
-        log("=== STIMMY HITBOX DIAGNOSTICS ===")
-        log("Player: " .. LocalPlayer.Name)
-        log("AnimalName: " .. tostring(character and character:GetAttribute("AnimalName")))
-        log("Hitbox Expander enabled: " .. tostring(Hit.on))
-        log("Closest priority: " .. tostring(Hit.priorityClosest))
-        log("Multiplier: " .. tostring(Hit.mult))
-        log("Hitboxes module loaded: " .. tostring(Hitboxes ~= nil))
-        if character then
-            log("Character: " .. character:GetFullName())
-            for _, attr in ipairs({ "AnimalName", "BasicAttacksDisabled", "JumpsDisabled" }) do
-                log("Character attribute " .. attr .. ": " .. tostring(character:GetAttribute(attr)))
-            end
-        end
-        if Hitboxes then
-            for _, key in ipairs({ "GetDefinitions", "GetReach" }) do
-                log("Hitboxes." .. key .. " type: " .. type(Hitboxes[key]))
-            end
-            log("GetDefinitions currently wrapped: " .. tostring(Hitboxes.GetDefinitions ~= origGetDefs))
-            log("GetReach currently wrapped: " .. tostring(Hitboxes.GetReach ~= origGetReach))
-        end
-
-        -- Compare original and expanded hitbox data for each live player target.
-        local myRoot = character and character:FindFirstChild("HumanoidRootPart")
-        local preferred = getPreferredHitTarget()
-        log("Preferred target: " .. tostring(preferred and preferred.Name))
-        if Hitboxes and origGetDefs and origGetReach then
-            for _, player in ipairs(Players:GetPlayers()) do
-                if player ~= LocalPlayer and player.Character then
-                    local target = player.Character
-                    local animal = target:GetAttribute("AnimalName")
-                    local root = target:FindFirstChild("HumanoidRootPart")
-                    local distance = myRoot and root and (root.Position - myRoot.Position).Magnitude
-                    log("TARGET " .. player.Name .. " animal=" .. tostring(animal)
-                        .. " distance=" .. tostring(distance)
-                        .. " safe=" .. tostring(isHitSafe(target))
-                        .. " closest=" .. tostring(target == preferred))
-                    local baseOk, baseDefs = pcall(origGetDefs, target)
-                    local expandedOk, expandedDefs = pcall(Hitboxes.GetDefinitions, target)
-                    log("  definitions original=" .. tostring(baseOk and type(baseDefs) == "table" and #baseDefs or baseDefs)
-                        .. " expanded=" .. tostring(expandedOk and type(expandedDefs) == "table" and #expandedDefs or expandedDefs))
-                    if baseOk and expandedOk and type(baseDefs) == "table" and type(expandedDefs) == "table" then
-                        for index, def in ipairs(baseDefs) do
-                            local expanded = expandedDefs[index]
-                            if expanded then
-                                log("  def[" .. index .. "] size " .. tostring(def.Size)
-                                    .. " -> " .. tostring(expanded.Size)
-                                    .. " anchor " .. tostring(def.AnchorRadius)
-                                    .. " -> " .. tostring(expanded.AnchorRadius))
-                            end
-                        end
-                    end
-                    local reachOk, baseReach = pcall(origGetReach, target)
-                    local expandedReachOk, expandedReach = pcall(Hitboxes.GetReach, target)
-                    log("  reach original=" .. tostring(reachOk and baseReach or baseReach)
-                        .. " expanded=" .. tostring(expandedReachOk and expandedReach or expandedReach))
-                end
-            end
-        else
-            log("Live target comparison skipped: original hitbox functions unavailable.")
-        end
-
-        local found, inspected = 0, 0
-        local ok, descendants = pcall(function() return game:GetDescendants() end)
-        if ok then
-            for _, obj in ipairs(descendants) do
-                if obj:IsA("ModuleScript") then
-                    local name = string.lower(obj.Name)
-                    local pathName = string.lower(obj:GetFullName())
-                    if string.find(name, "hit", 1, true) or string.find(name, "attack", 1, true)
-                        or string.find(name, "combat", 1, true) or string.find(name, "cobra", 1, true)
-                        or string.find(pathName, "cobra", 1, true) then
-                        found = found + 1
-                        if inspected < 80 then
-                            inspected = inspected + 1
-                            log("MODULE " .. obj:GetFullName())
-                            local required, exported = pcall(require, obj)
-                            if required and type(exported) == "table" then
-                                local keys = {}
-                                for k, v in pairs(exported) do
-                                    if type(k) == "string" and (type(v) == "function"
-                                        or string.find(string.lower(k), "hit", 1, true)
-                                        or string.find(string.lower(k), "reach", 1, true)
-                                        or string.find(string.lower(k), "attack", 1, true)
-                                        or string.find(string.lower(k), "cobra", 1, true)) then
-                                        keys[#keys + 1] = k .. ":" .. type(v)
-                                    end
-                                end
-                                table.sort(keys)
-                                log("  exports: " .. (#keys > 0 and table.concat(keys, ", ") or "(no relevant exports)"))
-                            elseif not required then
-                                log("  require failed: " .. tostring(exported))
-                            else
-                                log("  export type: " .. type(exported))
-                            end
-                        end
-                    end
-                end
-            end
-        else
-            log("GetDescendants failed: " .. tostring(descendants))
-        end
-        log("Matching ModuleScripts: " .. tostring(found) .. " (inspected " .. tostring(inspected) .. ")")
-        log("=== END DIAGNOSTICS ===")
-        local report = table.concat(lines, "\n")
-        print(report)
-        if setclipboard then
-            pcall(setclipboard, report)
-            notify("Hitbox diagnostics", "Scan complete. Report printed and copied to clipboard.")
-        else
-            notify("Hitbox diagnostics", "Scan complete. Report printed to the executor console.")
-        end
+    -- Compact recorder popup. The previous large diagnostics callback was removed
+    -- to avoid Luau's 200-local-register limit in this combat scope.
+    local CobraUI = { gui = nil, output = nil, active = false }
+    function CobraUI.setOutput(value)
+        if CobraUI.output then CobraUI.output.Text = tostring(value or "") end
     end
-
-    -- Replaces the former Scan Hitbox / Cobra Diagnostics button in the same slot.
-    CombatTab:Button({
-        Title = "Record Cobra Attack Scan (5s)",
-        Callback = function()
-            if CobraRecorder.active then
-                notify("Cobra recorder", "A scan is already running.")
-                return
+    function CobraUI.open()
+        if not CobraUI.gui then
+            local parent = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+            if type(gethui) == "function" then
+                local ok, hui = pcall(gethui)
+                if ok and hui then parent = hui end
             end
-            CobraRecorder.events = {}
-            CobraRecorder.started = tick()
-            CobraRecorder.active = true
-            recordCobraEvent("START; HitboxEnabled=" .. tostring(Hit.on)
-                .. "; ClosestPriority=" .. tostring(Hit.priorityClosest)
-                .. "; Multiplier=" .. tostring(Hit.mult))
-            notify("Cobra recorder", "Recording for 5 seconds. Attack the Cobra now!")
+            local gui = Instance.new("ScreenGui")
+            gui.Name = "StimmyCobraRecorder"
+            gui.ResetOnSpawn = false
+            gui.IgnoreGuiInset = true
+            gui.DisplayOrder = 10020
+            gui.Parent = parent
+            CobraUI.gui = gui
 
-            task.spawn(function()
-                local ok, err = pcall(function()
-                    local finishAt = tick() + 5
-                    while alive and tick() < finishAt do
-                        local localChar = LocalPlayer.Character
-                        local localRoot = localChar and localChar:FindFirstChild("HumanoidRootPart")
-                        local closest = getPreferredHitTarget()
-                        for _, player in ipairs(Players:GetPlayers()) do
-                            local target = player.Character
-                            if player ~= LocalPlayer and isCobraCharacter(target) then
-                                local root = target:FindFirstChild("HumanoidRootPart")
-                                local hum = target:FindFirstChildOfClass("Humanoid")
-                                local distance = (localRoot and root)
-                                    and (root.Position - localRoot.Position).Magnitude or "n/a"
-                                recordCobraEvent("SAMPLE player=" .. player.Name
-                                    .. " distance=" .. tostring(distance)
-                                    .. " closest=" .. tostring(closest == target)
-                                    .. " safe=" .. tostring(HitSafe[player.Name] == true)
-                                    .. " health=" .. tostring(hum and hum.Health)
-                                    .. " localAnimal=" .. cobraAnimalName(localChar))
+            local frame = Instance.new("Frame")
+            frame.Name = "RecorderWindow"
+            frame.Size = UDim2.fromOffset(510, 350)
+            frame.Position = UDim2.new(0.5, -255, 0.5, -175)
+            frame.BackgroundColor3 = Color3.fromRGB(22, 22, 26)
+            frame.BorderSizePixel = 0
+            frame.Parent = gui
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(0, 10)
+            corner.Parent = frame
+            local stroke = Instance.new("UIStroke")
+            stroke.Color = Color3.fromRGB(75, 75, 84)
+            stroke.Parent = frame
+
+            local heading = Instance.new("TextLabel")
+            heading.BackgroundTransparency = 1
+            heading.Position = UDim2.fromOffset(14, 9)
+            heading.Size = UDim2.new(1, -28, 0, 27)
+            heading.Font = Enum.Font.GothamSemibold
+            heading.Text = "Cobra Attack Recorder"
+            heading.TextColor3 = Color3.fromRGB(245, 245, 248)
+            heading.TextSize = 16
+            heading.TextXAlignment = Enum.TextXAlignment.Left
+            heading.Parent = frame
+
+            local output = Instance.new("TextBox")
+            output.Name = "Output"
+            output.Position = UDim2.fromOffset(12, 43)
+            output.Size = UDim2.new(1, -24, 1, -96)
+            output.BackgroundColor3 = Color3.fromRGB(13, 13, 16)
+            output.BorderSizePixel = 0
+            output.ClearTextOnFocus = false
+            output.MultiLine = true
+            output.TextEditable = false
+            output.TextWrapped = false
+            output.TextXAlignment = Enum.TextXAlignment.Left
+            output.TextYAlignment = Enum.TextYAlignment.Top
+            output.Font = Enum.Font.Code
+            output.TextSize = 12
+            output.TextColor3 = Color3.fromRGB(225, 225, 230)
+            output.Text = "Press Scan (5s), then attack the Cobra while the scan runs."
+            output.Parent = frame
+            local outputCorner = Instance.new("UICorner")
+            outputCorner.CornerRadius = UDim.new(0, 6)
+            outputCorner.Parent = output
+            CobraUI.output = output
+
+            local function makeButton(label, x, width, callback)
+                local button = Instance.new("TextButton")
+                button.Position = UDim2.new(0, x, 1, -42)
+                button.Size = UDim2.fromOffset(width, 30)
+                button.BackgroundColor3 = Color3.fromRGB(55, 55, 64)
+                button.BorderSizePixel = 0
+                button.Font = Enum.Font.GothamSemibold
+                button.Text = label
+                button.TextColor3 = Color3.fromRGB(245, 245, 248)
+                button.TextSize = 12
+                button.Parent = frame
+                local c = Instance.new("UICorner")
+                c.CornerRadius = UDim.new(0, 6)
+                c.Parent = button
+                button.MouseButton1Click:Connect(callback)
+            end
+
+            makeButton("Scan (5s)", 12, 112, function()
+                if CobraRecorder.active then
+                    CobraUI.setOutput("A 5-second scan is already running.")
+                    return
+                end
+                CobraRecorder.events = {}
+                CobraRecorder.started = tick()
+                CobraRecorder.active = true
+                recordCobraEvent("START; HitboxEnabled=" .. tostring(Hit.on)
+                    .. "; ClosestPriority=" .. tostring(Hit.priorityClosest)
+                    .. "; Multiplier=" .. tostring(Hit.mult))
+                CobraUI.setOutput("Recording for 5 seconds... Attack the Cobra now!")
+                task.spawn(function()
+                    local ok, err = pcall(function()
+                        local finishAt = tick() + 5
+                        while alive and tick() < finishAt do
+                            local localChar = LocalPlayer.Character
+                            local localRoot = localChar and localChar:FindFirstChild("HumanoidRootPart")
+                            local closest = getPreferredHitTarget()
+                            for _, player in ipairs(Players:GetPlayers()) do
+                                local target = player.Character
+                                if player ~= LocalPlayer and isCobraCharacter(target) then
+                                    local root = target:FindFirstChild("HumanoidRootPart")
+                                    local hum = target:FindFirstChildOfClass("Humanoid")
+                                    local distance = (localRoot and root)
+                                        and (root.Position - localRoot.Position).Magnitude or "n/a"
+                                    recordCobraEvent("SAMPLE player=" .. player.Name
+                                        .. " distance=" .. tostring(distance)
+                                        .. " closest=" .. tostring(closest == target)
+                                        .. " safe=" .. tostring(HitSafe[player.Name] == true)
+                                        .. " health=" .. tostring(hum and hum.Health)
+                                        .. " localAnimal=" .. cobraAnimalName(localChar))
+                                end
                             end
+                            task.wait(0.1)
                         end
-                        task.wait(0.1)
+                    end)
+                    CobraRecorder.active = false
+                    local lines = {
+                        "=== STIMMY 5-SECOND COBRA ATTACK RECORDING ===",
+                        "Hitbox Expander: " .. tostring(Hit.on),
+                        "Closest priority: " .. tostring(Hit.priorityClosest),
+                        "Multiplier: " .. tostring(Hit.mult),
+                        "Events captured: " .. tostring(#CobraRecorder.events),
+                    }
+                    for _, event in ipairs(CobraRecorder.events) do
+                        lines[#lines + 1] = event
                     end
+                    if not ok then
+                        lines[#lines + 1] = "Recorder error: " .. tostring(err)
+                    elseif #CobraRecorder.events <= 1 then
+                        lines[#lines + 1] = "No Cobra player samples or Hitboxes API calls captured."
+                    end
+                    lines[#lines + 1] = "=== END RECORDING ==="
+                    CobraUI.setOutput(table.concat(lines, "\\n"))
                 end)
+            end)
 
-                CobraRecorder.active = false
-                local lines = {
-                    "=== STIMMY 5-SECOND COBRA ATTACK RECORDING ===",
-                    "Hitbox Expander: " .. tostring(Hit.on),
-                    "Closest priority: " .. tostring(Hit.priorityClosest),
-                    "Multiplier: " .. tostring(Hit.mult),
-                    "Events captured: " .. tostring(#CobraRecorder.events),
-                }
-                for _, event in ipairs(CobraRecorder.events) do
-                    lines[#lines + 1] = event
-                end
-                if not ok then
-                    lines[#lines + 1] = "Recorder error: " .. tostring(err)
-                elseif #CobraRecorder.events <= 1 then
-                    lines[#lines + 1] = "No Cobra player samples or Hitboxes API calls captured."
-                end
-                lines[#lines + 1] = "=== END RECORDING ==="
-                local report = table.concat(lines, "\\n")
-                print(report)
+            makeButton("Copy", 132, 78, function()
+                local value = CobraUI.output and CobraUI.output.Text or ""
                 if setclipboard then
-                    pcall(setclipboard, report)
-                    notify("Cobra recorder", "Scan complete. Report copied to clipboard.")
+                    local ok = pcall(setclipboard, value)
+                    if ok then notify("Cobra recorder", "Output copied.") end
                 else
-                    notify("Cobra recorder", "Scan complete. Report printed to console.")
+                    notify("Cobra recorder", "Clipboard is not supported by this executor.")
                 end
             end)
-        end,
-    })
+            makeButton("Clear Output", 222, 112, function()
+                if CobraRecorder.active then
+                    CobraUI.setOutput("Scan is running. Output will appear when it finishes.")
+                else
+                    CobraRecorder.events = {}
+                    CobraUI.setOutput("")
+                end
+            end)
+            makeButton("Close", 344, 78, function()
+                gui.Enabled = false
+            end)
+        end
+        CobraUI.gui.Enabled = true
+    end
 
+    CombatTab:Button({
+        Title = "Open Cobra Recorder",
+        Callback = function() CobraUI.open() end,
+    })
 
     CombatTab:Slider({
         Title = "Hitbox Size Multiplier",
