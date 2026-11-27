@@ -2757,8 +2757,6 @@ do
     -- ---------- hitbox expander ----------
     local Hit = {
         on = false, mult = 5, priorityClosest = true, preferredTarget = nil, targetScanAt = 0,
-        diagnostics = false, diagSeenDefs = {}, diagSeenReach = {}, diagLines = {},
-        diagStats = { Definitions = 0, Reach = 0, CobraNamed = 0 },
     }
     local Hitboxes, origGetDefs, origGetReach = nil, nil, nil
     local ScaledCache = setmetatable({}, { __mode = "k" }) -- [original definitions] = { mult, list }
@@ -2830,94 +2828,6 @@ do
         return list
     end
 
-    local function logHitboxDiag(message)
-        local line = tostring(message)
-        if not line:find("^%[HitboxDiag%]") then line = "[HitboxDiag] " .. line end
-        Hit.diagLines[#Hit.diagLines + 1] = line
-        warn(line)
-    end
-
-    local function isCobraForDiagnostics(char)
-        if typeof(char) ~= "Instance" then return false end
-        local ok, animalName = pcall(function() return char:GetAttribute("AnimalName") end)
-        local modelName = tostring(char.Name or "")
-        return (type(animalName) == "string" and animalName:lower():find("cobra", 1, true) ~= nil)
-            or modelName:lower():find("cobra", 1, true) ~= nil
-    end
-
-    local function logCobraDefinitions(char, defs)
-        if not Hit.diagnostics or typeof(char) ~= "Instance" or Hit.diagSeenDefs[char] then return end
-        Hit.diagSeenDefs[char] = true
-        Hit.diagStats.Definitions = Hit.diagStats.Definitions + 1
-        local ok, animalName = pcall(function() return char:GetAttribute("AnimalName") end)
-        local cobraNamed = isCobraForDiagnostics(char)
-        if cobraNamed then Hit.diagStats.CobraNamed = Hit.diagStats.CobraNamed + 1 end
-        logHitboxDiag("[HitboxDiag] GetDefinitions | cobraNameMatch=" .. tostring(cobraNamed)
-            .. " | model=" .. tostring(char:GetFullName())
-            .. " | class=" .. tostring(char.ClassName)
-            .. " | AnimalName=" .. tostring(ok and animalName or nil)
-            .. " | resultType=" .. typeof(defs)
-            .. " | count=" .. tostring(type(defs) == "table" and #defs or "n/a"))
-        if type(defs) == "table" then
-            for index, definition in ipairs(defs) do
-                if type(definition) == "table" then
-                    local keys = {}
-                    for key in pairs(definition) do keys[#keys + 1] = tostring(key) end
-                    table.sort(keys)
-                    logHitboxDiag("[HitboxDiag] Definition #" .. index
-                        .. " | Size=" .. tostring(definition.Size)
-                        .. " | AnchorRadius=" .. tostring(definition.AnchorRadius)
-                        .. " | keys=" .. table.concat(keys, ","))
-                else
-                    logHitboxDiag("[HitboxDiag] Definition #" .. index .. " | type=" .. typeof(definition))
-                end
-            end
-        end
-    end
-
-    local function logCobraReach(char, reach)
-        if not Hit.diagnostics or typeof(char) ~= "Instance" or Hit.diagSeenReach[char] then return end
-        Hit.diagSeenReach[char] = true
-        Hit.diagStats.Reach = Hit.diagStats.Reach + 1
-        local cobraNamed = isCobraForDiagnostics(char)
-        logHitboxDiag("[HitboxDiag] TARGET | nameMatch=" .. tostring(cobraNamed)
-            .. " | model=" .. tostring(char:GetFullName())
-            .. " | class=" .. tostring(char.ClassName)
-            .. " | baseReach=" .. tostring(reach)
-            .. " | reachType=" .. typeof(reach)
-            .. " | expanderEnabled=" .. tostring(Hit.on)
-            .. " | multiplier=" .. tostring(Hit.mult))
-        local attributes = char:GetAttributes()
-        for key, value in pairs(attributes) do
-            logHitboxDiag("[HitboxDiag] ATTRIBUTE | " .. tostring(key) .. "=" .. tostring(value))
-        end
-        local children = char:GetChildren()
-        local childNames = {}
-        for _, child in ipairs(children) do
-            childNames[#childNames + 1] = child.Name .. ":" .. child.ClassName
-        end
-        logHitboxDiag("[HitboxDiag] CHILDREN | count=" .. #children .. " | " .. table.concat(childNames, ", "))
-        local descendants = char:GetDescendants()
-        local partCount = 0
-        for _, object in ipairs(descendants) do
-            if object:IsA("BasePart") then
-                partCount = partCount + 1
-                if partCount <= 40 then
-                    logHitboxDiag("[HitboxDiag] PART | path=" .. object:GetFullName()
-                        .. " | size=" .. tostring(object.Size)
-                        .. " | transparency=" .. tostring(object.Transparency)
-                        .. " | canQuery=" .. tostring(object.CanQuery)
-                        .. " | canTouch=" .. tostring(object.CanTouch)
-                        .. " | canCollide=" .. tostring(object.CanCollide)
-                        .. " | collisionGroup=" .. tostring(object.CollisionGroup))
-                end
-            end
-        end
-        logHitboxDiag("[HitboxDiag] MODEL SUMMARY | descendants=" .. #descendants
-            .. " | baseParts=" .. partCount
-            .. " | partsPrinted=" .. math.min(partCount, 40))
-    end
-
     local function installOverrides()
         local H = Hitboxes
         pcall(function() if setreadonly then setreadonly(H, false) end end)
@@ -2927,9 +2837,6 @@ do
         return pcall(function()
             H.GetDefinitions = function(char, ...)
                 local defs = gd(char, ...)
-                if typeof(char) == "Instance" and char ~= LocalPlayer.Character then
-                    logCobraDefinitions(char, defs)
-                end
                 if Hit.on and Hit.mult > 1 and type(defs) == "table" and typeof(char) == "Instance"
                     and char ~= LocalPlayer.Character and not isHitSafe(char) then
                     return scaledDefs(defs)
@@ -2938,9 +2845,6 @@ do
             end
             H.GetReach = function(char, ...)
                 local r = gr(char, ...)
-                if typeof(char) == "Instance" and char ~= LocalPlayer.Character then
-                    logCobraReach(char, r)
-                end
                 if r and isPreferredHitTarget(char) then
                     return r * Hit.mult
                 end
@@ -5793,76 +5697,6 @@ updateAutoLoadLabel()
 
 local SettingsTab = Window:Tab({ Title = "Settings", Icon = "settings" })
 hook(SettingsTab)
-
-SettingsTab:Section({ Title = "Diagnostics" })
-
-SettingsTab:Paragraph({
-    Title = "Cobra Hitbox Diagnostics (Detailed)",
-    Content = "Passively inspects the target model: attributes, children, BasePart sizes, query/touch/collision settings, and GetReach results. Enable, reproduce one Cobra encounter, then send every [HitboxDiag] console line.",
-})
-
-SettingsTab:Toggle({
-    Title = "Enable Detailed Hitbox Scan",
-    Value = false,
-    Flag = "CobraHitboxDiagnostics",
-    Callback = function(v)
-        Hit.diagnostics = v
-        Hit.diagSeenDefs = {}
-        Hit.diagSeenReach = {}
-        Hit.diagLines = {}
-        Hit.diagStats = { Definitions = 0, Reach = 0, CobraNamed = 0 }
-        if v then
-            notify("Hitbox Diagnostics", "Scan enabled. Reproduce one Cobra encounter, then copy all [HitboxDiag] lines from the Developer Console.")
-        else
-            notify("Hitbox Diagnostics", "Scan paused.")
-        end
-    end,
-})
-
-SettingsTab:Button({
-    Title = "Copy Diagnostics",
-    Callback = function()
-        if #Hit.diagLines == 0 then
-            notify("Hitbox Diagnostics", "No scan data yet. Enable the scan and encounter a Cobra first.")
-            return
-        end
-        local output = table.concat(Hit.diagLines, "\n")
-        local copier = setclipboard or toclipboard
-        if type(copier) == "function" then
-            local ok = pcall(copier, output)
-            if ok then
-                notify("Hitbox Diagnostics", "Copied " .. tostring(#Hit.diagLines) .. " diagnostic lines.")
-            else
-                notify("Hitbox Diagnostics", "Clipboard function failed. Use the console output instead.")
-            end
-        else
-            notify("Hitbox Diagnostics", "Clipboard is not supported by this executor.")
-        end
-    end,
-})
-
-SettingsTab:Button({
-    Title = "Print Diagnostics Summary",
-    Callback = function()
-        warn("[HitboxDiag] SUMMARY | GetDefinitions models=" .. tostring(Hit.diagStats.Definitions)
-            .. " | GetReach models=" .. tostring(Hit.diagStats.Reach)
-            .. " | Cobra name matches=" .. tostring(Hit.diagStats.CobraNamed)
-            .. " | expanderEnabled=" .. tostring(Hit.on)
-            .. " | multiplier=" .. tostring(Hit.mult))
-        notify("Hitbox Diagnostics", "Summary printed to Developer Console.")
-    end,
-})
-
-SettingsTab:Button({
-    Title = "Reset Diagnostics",
-    Callback = function()
-        Hit.diagSeenDefs = {}
-        Hit.diagSeenReach = {}
-        Hit.diagLines = {}
-        Hit.diagStats = { Definitions = 0, Reach = 0, CobraNamed = 0 }
-        notify("Hitbox Diagnostics", "Scan counters and copied log buffer reset.")
-    end,
-})
 
 -- ================= TAB 3: MENU (minimize key) =================
 WindowOpen = true
