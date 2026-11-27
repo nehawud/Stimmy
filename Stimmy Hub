@@ -3520,7 +3520,7 @@ do
 
     local function setupGroupWhitelist()
     local GroupAutoAdded = GroupAutoAddedOwnership
-    local confirmedGroupMembers
+    local promptedGroupMembers = {}
 
     local function getCurrentGroupMembers()
         local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
@@ -3593,8 +3593,8 @@ do
                     {
                         Title = "✓",
                         Callback = function()
-                            if not AutoWhitelistGroup.on or not confirmedGroupMembers
-                                or not confirmedGroupMembers[playerName] or player.Parent ~= Players then return end
+                            if not AutoWhitelistGroup.on or not promptedGroupMembers[playerName]
+                                or player.Parent ~= Players then return end
                             local liveMembers = getCurrentGroupMembers()
                             if not liveMembers or not liveMembers[playerName] then return end
                             local addedHit, addedAura = false, false
@@ -3626,17 +3626,17 @@ do
                 warn("[AnimalFarm] group membership scan error: " .. tostring(currentMembers))
                 currentMembers = nil
             end
-            if currentMembers then
-                if not confirmedGroupMembers then
-                    confirmedGroupMembers = currentMembers
-                else
-                    for playerName in pairs(currentMembers) do
-                        if not confirmedGroupMembers[playerName] then
-                            confirmedGroupMembers[playerName] = true
-                            local player = Players:FindFirstChild(playerName)
-                            if AutoWhitelistGroup.on and player then
-                                promptToWhitelistGroupMember(player)
-                            end
+            if not AutoWhitelistGroup.on then
+                table.clear(promptedGroupMembers)
+            elseif currentMembers then
+                -- Scan the full current group whenever enabled, including members
+                -- who were already grouped before the toggle was turned on.
+                for playerName in pairs(currentMembers) do
+                    if not promptedGroupMembers[playerName] then
+                        local player = Players:FindFirstChild(playerName)
+                        if player then
+                            promptedGroupMembers[playerName] = true
+                            promptToWhitelistGroupMember(player)
                         end
                     end
                 end
