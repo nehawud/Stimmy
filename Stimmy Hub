@@ -3188,6 +3188,11 @@ do
         end,
     })
 
+    local DiagnosticsTab = Window:Tab({ Title = "Diagnostics", Icon = "scan-search" })
+    hook(DiagnosticsTab)
+    DiagnosticsTab:Section({ Title = "Cobra Diagnostics" })
+    DiagnosticsTab:Paragraph({ Title = "Run a 5-second scan while attacking. Reports copy to clipboard when supported." })
+
     local function runHitboxDiagnostics()
         local workspaceService = game:GetService("Workspace")
         local duration = 5
@@ -3440,7 +3445,7 @@ do
         end
     end
 
-    CombatTab:Button({
+    DiagnosticsTab:Button({
         Title = "Record Cobra Collider Changes (5s)",
         Callback = function()
             task.spawn(function()
@@ -3453,7 +3458,7 @@ do
         end,
     })
 
-    CombatTab:Button({
+    DiagnosticsTab:Button({
         Title = "Record Cobra Attack Scan (5s)",
         Callback = function()
             if CobraRecorder.active then
