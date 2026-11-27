@@ -3243,12 +3243,23 @@ do
                             local root = target:FindFirstChild("HumanoidRootPart")
                             local hum = target:FindFirstChildOfClass("Humanoid")
                             local distance = (localRoot and root) and (root.Position - localRoot.Position).Magnitude or nil
+                            local activeTracks = {}
+                            local localHum = localChar and localChar:FindFirstChildOfClass("Humanoid")
+                            local animator = localHum and localHum:FindFirstChildOfClass("Animator")
+                            if animator then
+                                for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                                    if track.IsPlaying and track.Priority.Value >= Enum.AnimationPriority.Action.Value then
+                                        activeTracks[#activeTracks + 1] = tostring(track.Name)
+                                    end
+                                end
+                            end
                             recordCobraEvent("SAMPLE player=" .. player.Name
                                 .. " distance=" .. tostring(distance)
                                 .. " closest=" .. tostring(closest == target)
                                 .. " safe=" .. tostring(HitSafe[player.Name] == true)
                                 .. " health=" .. tostring(hum and hum.Health)
-                                .. " localAnimal=" .. cobraAnimalName(localChar))
+                                .. " localAnimal=" .. cobraAnimalName(localChar)
+                                .. " attackTracks={" .. table.concat(activeTracks, ",") .. "}")
                         end
                     end
                     task.wait(0.1)
