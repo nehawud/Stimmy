@@ -3761,32 +3761,29 @@ do
             end)
         end
     
-        local function setupGroupWhitelist()
-            task.spawn(function()
-                while alive do
-                    task.wait(0.75)
-                    local scanOk, currentMembers = pcall(getCurrentGroupMembers)
-                    if not scanOk then
-                        warn("[AnimalFarm] group membership scan error: " .. tostring(currentMembers))
-                        currentMembers = nil
-                    end
-                    if not AutoWhitelistGroup.on then
-                        table.clear(promptedGroupMembers)
-                    elseif currentMembers then
-                        for playerName in pairs(currentMembers) do
-                            if not promptedGroupMembers[playerName] then
-                                local player = Players:FindFirstChild(playerName)
-                                if player then
-                                    promptedGroupMembers[playerName] = true
-                                    promptToWhitelistGroupMember(player)
-                                end
+        task.spawn(function()
+            while alive do
+                task.wait(0.75)
+                local ok, members = pcall(getCurrentGroupMembers)
+                if not ok then
+                    warn("[AnimalFarm] group membership scan error: " .. tostring(members))
+                    members = nil
+                end
+                if not AutoWhitelistGroup.on then
+                    table.clear(promptedGroupMembers)
+                elseif members then
+                    for playerName in pairs(members) do
+                        if not promptedGroupMembers[playerName] then
+                            local player = Players:FindFirstChild(playerName)
+                            if player then
+                                promptedGroupMembers[playerName] = true
+                                promptToWhitelistGroupMember(player)
                             end
                         end
                     end
                 end
-            end)
-        end
-        setupGroupWhitelist()
+            end
+        end)
     end)()
 
     CombatTab:Section({ Title = "Anti Grab" })
