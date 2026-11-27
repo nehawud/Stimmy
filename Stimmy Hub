@@ -3668,65 +3668,88 @@ do
 
     -- Keep group-whitelist locals isolated from the main script scope to avoid Luau's 200-register limit.
     do
-        local function getCurrentGroupMembers()
+        local function findCurrentGroupFrame()
             local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
             local statsGui = playerGui and playerGui:FindFirstChild("AnimalStatsScreenGui")
             local groupingFrame = statsGui and statsGui:FindFirstChild("GroupingFrame", true)
             local myGroupFrame = groupingFrame and groupingFrame:FindFirstChild("MyGroupScrollingFrame", true)
-            local inGroupFrame = myGroupFrame and myGroupFrame:FindFirstChild("InGroupFrame", true)
-            if not inGroupFrame then return nil end
-    
-            local textValues, playerValues, userIds = {}, {}, {}
-            for _, item in ipairs(inGroupFrame:GetDescendants()) do
-                if item:IsA("ObjectValue") and item.Value and item.Value:IsA("Player") then
-                    playerValues[item.Value.Name] = true
-                elseif item:IsA("IntValue") or item:IsA("NumberValue") then
-                    if type(item.Value) == "number" then userIds[item.Value] = true end
-                elseif item:IsA("StringValue") and item.Value ~= "" then
-                    textValues[#textValues + 1] = string.lower(item.Value)
-                end
-                if item.Name and item.Name ~= "" then
-                    textValues[#textValues + 1] = string.lower(item.Name)
-                end
-                if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
-                    local text = ""
-                    pcall(function() text = item.Text end)
-                    if text ~= "" then textValues[#textValues + 1] = string.lower(text) end
-                end
-                for key, value in pairs(item:GetAttributes()) do
-                    local keyLower = string.lower(tostring(key))
-                    if keyLower:find("user", 1, true) or keyLower:find("player", 1, true)
-                        or keyLower:find("member", 1, true) or keyLower:find("name", 1, true) then
-                        if type(value) == "number" then
-                            userIds[value] = true
-                        elseif type(value) == "string" and value ~= "" then
-                            textValues[#textValues + 1] = string.lower(value)
-                        end
+            return myGroupFrame and myGroupFrame:FindFirstChild("InGroupFrame", true)
+        end
+
+        local function addGroupAttributeValues(item, textValues, userIds)
+            for key, value in pairs(item:GetAttributes()) do
+                local keyLower = string.lower(tostring(key))
+                local isMemberKey = keyLower:find("user", 1, true)
+                    or keyLower:find("player", 1, true)
+                    or keyLower:find("member", 1, true)
+                    or keyLower:find("name", 1, true)
+                if isMemberKey then
+                    if type(value) == "number" then
+                        userIds[value] = true
+                    elseif type(value) == "string" and value ~= "" then
+                        textValues[#textValues + 1] = string.lower(value)
                     end
                 end
             end
-    
+        end
+
+        local function addGroupItemValues(item, textValues, playerValues, userIds)
+            if item:IsA("ObjectValue") and item.Value and item.Value:IsA("Player") then
+                playerValues[item.Value.Name] = true
+            elseif (item:IsA("IntValue") or item:IsA("NumberValue")) and type(item.Value) == "number" then
+                userIds[item.Value] = true
+            elseif item:IsA("StringValue") and item.Value ~= "" then
+                textValues[#textValues + 1] = string.lower(item.Value)
+            end
+            if item.Name and item.Name ~= "" then
+                textValues[#textValues + 1] = string.lower(item.Name)
+            end
+            if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
+                local labelText = ""
+                pcall(function() labelText = item.Text end)
+                if labelText ~= "" then
+                    textValues[#textValues + 1] = string.lower(labelText)
+                end
+            end
+            addGroupAttributeValues(item, textValues, userIds)
+        end
+
+        local function collectGroupIdentifiers(inGroupFrame)
+            local identifiers = { Text = {}, Players = {}, UserIds = {} }
+            for _, item in ipairs(inGroupFrame:GetDescendants()) do
+                addGroupItemValues(item, identifiers.Text, identifiers.Players, identifiers.UserIds)
+            end
+            return identifiers
+        end
+
+        local function playerMatchesGroupIdentifiers(player, identifiers)
+            if identifiers.Players[player.Name] or identifiers.UserIds[player.UserId] then
+                return true
+            end
+            local name = string.lower(player.Name)
+            local displayName = string.lower(player.DisplayName)
+            for _, value in ipairs(identifiers.Text) do
+                if string.find(value, name, 1, true)
+                    or (displayName ~= "" and string.find(value, displayName, 1, true)) then
+                    return true
+                end
+            end
+            return false
+        end
+
+        local function getCurrentGroupMembers()
+            local inGroupFrame = findCurrentGroupFrame()
+            if not inGroupFrame then return nil end
+            local identifiers = collectGroupIdentifiers(inGroupFrame)
             local members = {}
             for _, player in ipairs(Players:GetPlayers()) do
-                if player ~= LocalPlayer then
-                    local name = string.lower(player.Name)
-                    local displayName = string.lower(player.DisplayName)
-                    local matched = playerValues[player.Name] == true or userIds[player.UserId] == true
-                    if not matched then
-                        for _, value in ipairs(textValues) do
-                            if string.find(value, name, 1, true)
-                                or (displayName ~= "" and string.find(value, displayName, 1, true)) then
-                                matched = true
-                                break
-                            end
-                        end
-                    end
-                    if matched then members[player.Name] = true end
+                if player ~= LocalPlayer and playerMatchesGroupIdentifiers(player, identifiers) then
+                    members[player.Name] = true
                 end
             end
             return members
         end
-    
+
         local promptedGroupMembers = {}
         local function promptToWhitelistGroupMember(player)
             local playerName = player.Name
