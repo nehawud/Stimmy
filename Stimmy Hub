@@ -4521,7 +4521,7 @@ do
     })
 
     VisualsTab:Toggle({
-        Title = "Animal Name ESP",
+        Title = "Custom Name ESP",
         Value = false,
         Flag = "ESPAnimalName",
         Callback = function(v) ESP.animalName = v end,
