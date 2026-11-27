@@ -3473,7 +3473,7 @@ do
         end
     end)
 
-    local plConns = {
+    Hit.playerConnections = {
         Players.PlayerAdded:Connect((function()
             local queued = false
             return function()
@@ -3502,9 +3502,12 @@ do
         end)()),
     }
 
-    local Latch = (function()
+    -- Anti Grab runs in its own function scope so its locals never consume
+    -- registers from the large Combat tab scope.
+    ;(function()
     -- ---------- anti grab ----------
     local Latch = { on = false, delay = 0.1 }
+    Hit.Latch = Latch
     local LatchedRemote
 
     local function getLatchRemote()
@@ -3555,7 +3558,21 @@ do
             wasLatched = latched
         end
     end)
-        return Latch
+
+    CombatTab:Section({ Title = "Anti Grab" })
+    CombatTab:Toggle({
+        Title = "Anti Grab",
+        Value = false,
+        Flag = "AutoEscapeLatchOn",
+        Callback = function(v) Latch.on = v end,
+    })
+    CombatTab:Slider({
+        Title = "Anti Grab Delay",
+        Step = 0.05,
+        Value = { Min = 0, Max = 1, Default = Latch.delay },
+        Flag = "LatchEscapeDelay",
+        Callback = function(v) Latch.delay = math.clamp(v, 0, 1) end,
+    })
     end)()
 
 
@@ -3951,23 +3968,6 @@ do
         end
     end)
 
-    CombatTab:Section({ Title = "Anti Grab" })
-
-    CombatTab:Toggle({
-        Title = "Anti Grab",
-        Value = false,
-        Flag = "AutoEscapeLatchOn",
-        Callback = function(v) Latch.on = v end,
-    })
-
-    CombatTab:Slider({
-        Title = "Anti Grab Delay",
-        Step = 0.05,
-        Value = { Min = 0, Max = 1, Default = Latch.delay },
-        Flag = "LatchEscapeDelay",
-        Callback = function(v) Latch.delay = math.clamp(v, 0, 1) end,
-    })
-
     ;(function()
     local PredatorAlert = { on = false, distanceMeters = 10, ignoredPlayers = {} }
     local predatorSound = Instance.new("Sound")
@@ -4137,13 +4137,13 @@ do
         Hit.on = false
         Aura.on = false
         AutoSpecial.on = false
-        Latch.on = false
+        if Hit.Latch then Hit.Latch.on = false end
         InfStam.on = false
         InfOxy.on = false
         if combatVitalsConn then combatVitalsConn:Disconnect() end
         removeOverrides()
         if auraKeyConn then auraKeyConn:Disconnect() end
-        for _, c in ipairs(plConns) do pcall(function() c:Disconnect() end) end
+        for _, c in ipairs(Hit.playerConnections or {}) do pcall(function() c:Disconnect() end) end
     end
 end
 
