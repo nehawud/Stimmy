@@ -3254,6 +3254,16 @@ do
         end)()),
     }
 
+    -- Refresh displayed animal names periodically so changing animals updates both dropdowns.
+    task.spawn(function()
+        while alive do
+            task.wait(1.5)
+            if not alive then break end
+            if refreshHitList then pcall(refreshHitList) end
+            if refreshAuraList then pcall(refreshAuraList) end
+        end
+    end)
+
     local Latch = (function()
     -- ---------- anti grab ----------
     local Latch = { on = false, delay = 0.1 }
