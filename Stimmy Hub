@@ -3666,10 +3666,6 @@ do
         end)()
     end)()
 
-    local function setupGroupWhitelist()
-    local GroupAutoAdded = GroupAutoAddedOwnership
-    local promptedGroupMembers = {}
-
     local function getCurrentGroupMembers()
         local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
         local statsGui = playerGui and playerGui:FindFirstChild("AnimalStatsScreenGui")
@@ -3677,7 +3673,6 @@ do
         local myGroupFrame = groupingFrame and groupingFrame:FindFirstChild("MyGroupScrollingFrame", true)
         local inGroupFrame = myGroupFrame and myGroupFrame:FindFirstChild("InGroupFrame", true)
         if not inGroupFrame then return nil end
-
 
         local textValues, playerValues, userIds = {}, {}, {}
         for _, item in ipairs(inGroupFrame:GetDescendants()) do
@@ -3688,7 +3683,6 @@ do
             elseif item:IsA("StringValue") and item.Value ~= "" then
                 textValues[#textValues + 1] = string.lower(item.Value)
             end
-
             if item.Name and item.Name ~= "" then
                 textValues[#textValues + 1] = string.lower(item.Name)
             end
@@ -3730,6 +3724,8 @@ do
         end
         return members
     end
+
+    local promptedGroupMembers = {}
     local function promptToWhitelistGroupMember(player)
         local playerName = player.Name
         pcall(function()
@@ -3748,7 +3744,7 @@ do
                             local addedHit, addedAura = false, false
                             if not HitSafe[playerName] then HitSafe[playerName] = true; addedHit = true end
                             if not AuraSafe[playerName] then AuraSafe[playerName] = true; addedAura = true end
-                            GroupAutoAdded[playerName] = {
+                            GroupAutoAddedOwnership[playerName] = {
                                 Hitbox = addedHit,
                                 KillAura = addedAura,
                             }
@@ -3757,40 +3753,36 @@ do
                             if ConfigReady then task.defer(saveServerSafeLists) end
                         end,
                     },
-                    {
-                        Title = "✕",
-                        Callback = function() end,
-                    },
+                    { Title = "✕", Callback = function() end },
                 },
             })
         end)
     end
 
-    task.spawn(function()
-        while alive do
-            task.wait(0.75)
-            local scanOk, currentMembers = pcall(getCurrentGroupMembers)
-            if not scanOk then
-                warn("[AnimalFarm] group membership scan error: " .. tostring(currentMembers))
-                currentMembers = nil
-            end
-            if not AutoWhitelistGroup.on then
-                table.clear(promptedGroupMembers)
-            elseif currentMembers then
-                -- Scan the full current group whenever enabled, including members
-                -- who were already grouped before the toggle was turned on.
-                for playerName in pairs(currentMembers) do
-                    if not promptedGroupMembers[playerName] then
-                        local player = Players:FindFirstChild(playerName)
-                        if player then
-                            promptedGroupMembers[playerName] = true
-                            promptToWhitelistGroupMember(player)
+    local function setupGroupWhitelist()
+        task.spawn(function()
+            while alive do
+                task.wait(0.75)
+                local scanOk, currentMembers = pcall(getCurrentGroupMembers)
+                if not scanOk then
+                    warn("[AnimalFarm] group membership scan error: " .. tostring(currentMembers))
+                    currentMembers = nil
+                end
+                if not AutoWhitelistGroup.on then
+                    table.clear(promptedGroupMembers)
+                elseif currentMembers then
+                    for playerName in pairs(currentMembers) do
+                        if not promptedGroupMembers[playerName] then
+                            local player = Players:FindFirstChild(playerName)
+                            if player then
+                                promptedGroupMembers[playerName] = true
+                                promptToWhitelistGroupMember(player)
+                            end
                         end
                     end
                 end
             end
-        end
-    end)
+        end)
     end
     setupGroupWhitelist()
 
