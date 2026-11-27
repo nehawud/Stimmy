@@ -3189,129 +3189,265 @@ do
     })
 
     local function runHitboxDiagnostics()
-        local lines = {}
-        local counts = {}
-        local function log(value)
-            lines[#lines + 1] = tostring(value)
-        end
         local workspaceService = game:GetService("Workspace")
-        local descendants = workspaceService:GetDescendants()
-        local total = #descendants
-        local relevant = 0
-        local detailLimit = 12000
-        local function hasClue(name)
-            name = string.lower(name)
-            for _, word in ipairs({ "cobra", "hit", "hurt", "attack", "damage", "collision", "box", "ray", "touch", "bite", "tongue", "root" }) do
-                if string.find(name, word, 1, true) then return true end
-            end
-            return false
+        local duration = 5
+        local sampleInterval = 0.1
+        local tracked = {}
+        local events = {}
+        local queryCopySnapshots = {}
+        local sampleCount = 0
+        local startedAt = tick()
+        local function logEvent(message)
+            events[#events + 1] = string.format("[+%.2fs] %s", tick() - startedAt, tostring(message))
         end
-        local function safeValue(value)
-            local kind = typeof(value)
-            if kind == "string" or kind == "number" or kind == "boolean" then
-                return tostring(value)
-            end
-            if kind == "Vector3" or kind == "CFrame" or kind == "Color3" or kind == "EnumItem" then
-                return tostring(value)
-            end
-            return nil
+        local function vectorChanged(a, b)
+            return (a - b).Magnitude > 0.001
         end
-
-        log("=== STIMMY WORKSPACE DIAGNOSTICS ===")
-        log("Local player: " .. tostring(LocalPlayer.Name))
-        log("Local animal: " .. tostring(LocalPlayer.Character and LocalPlayer.Character:GetAttribute("AnimalName")))
-        log("Hitbox Expander enabled: " .. tostring(Hit.on))
-        log("Closest priority: " .. tostring(Hit.priorityClosest))
-        log("Multiplier: " .. tostring(Hit.mult))
-        log("Workspace: " .. workspaceService:GetFullName())
-        log("Total descendants: " .. tostring(total))
-        log("Format: class | full path | selected properties | attributes")
-        log("NOTE: This is a metadata inventory of every Workspace descendant, not a clone of game assets or script source.")
-
-        for _, obj in ipairs(descendants) do
-            local className = obj.ClassName
-            counts[className] = (counts[className] or 0) + 1
-            if hasClue(obj.Name) then relevant = relevant + 1 end
-        end
-
-        local classNames = {}
-        for className in pairs(counts) do classNames[#classNames + 1] = className end
-        table.sort(classNames)
-        log("--- CLASS COUNTS ---")
-        for _, className in ipairs(classNames) do
-            log(className .. "=" .. tostring(counts[className]))
-        end
-        log("--- FULL DESCENDANT INVENTORY ---")
-
-        local written = 0
-        for _, obj in ipairs(descendants) do
-            if written >= detailLimit then break end
-            written = written + 1
-            local fields = { obj.ClassName, obj:GetFullName() }
-            if obj:IsA("BasePart") then
-                fields[#fields + 1] = "Size=" .. tostring(obj.Size)
-                fields[#fields + 1] = "Position=" .. tostring(obj.Position)
-                fields[#fields + 1] = "Anchored=" .. tostring(obj.Anchored)
-                fields[#fields + 1] = "CanQuery=" .. tostring(obj.CanQuery)
-                fields[#fields + 1] = "CanTouch=" .. tostring(obj.CanTouch)
-                fields[#fields + 1] = "CanCollide=" .. tostring(obj.CanCollide)
-                fields[#fields + 1] = "Transparency=" .. tostring(obj.Transparency)
-            elseif obj:IsA("Attachment") then
-                fields[#fields + 1] = "Position=" .. tostring(obj.Position)
-            elseif obj:IsA("Humanoid") then
-                fields[#fields + 1] = "Health=" .. tostring(obj.Health)
-                fields[#fields + 1] = "MaxHealth=" .. tostring(obj.MaxHealth)
-                fields[#fields + 1] = "RigType=" .. tostring(obj.RigType)
-            elseif obj:IsA("Model") then
-                local primary = obj.PrimaryPart
-                fields[#fields + 1] = "PrimaryPart=" .. tostring(primary and primary:GetFullName() or nil)
-            end
-
-            local attributes = {}
-            local ok, attributeMap = pcall(function() return obj:GetAttributes() end)
-            if ok then
-                for key, value in pairs(attributeMap) do
-                    local rendered = safeValue(value)
-                    if rendered then attributes[#attributes + 1] = tostring(key) .. "=" .. rendered end
+        local function getCobraModels()
+            local models = {}
+            for _, obj in ipairs(workspaceService:GetChildren()) do
+                if obj:IsA("Model") and tostring(obj:GetAttribute("AnimalName")):lower() == "cobra" then
+                    models[#models + 1] = obj
                 end
             end
-            table.sort(attributes)
-            if #attributes > 0 then fields[#fields + 1] = "Attributes={" .. table.concat(attributes, ",") .. "}" end
-            log(table.concat(fields, " | "))
+            local localChar = LocalPlayer.Character
+            if localChar and localChar:IsA("Model")
+                and tostring(localChar:GetAttribute("AnimalName")):lower() == "cobra" then
+                local found = false
+                for _, model in ipairs(models) do if model == localChar then found = true break end end
+                if not found then table.insert(models, 1, localChar) end
+            end
+            return models
+        end
+        local function snapshotModel(model)
+            local folder = model:FindFirstChild("RagdollColliderParts")
+            local parts = {}
+            if folder then
+                for _, obj in ipairs(folder:GetDescendants()) do
+                    if obj:IsA("BasePart") then
+                        parts[obj:GetFullName()] = {
+                            name = obj.Name,
+                            path = obj:GetFullName(),
+                            size = obj.Size,
+                            position = obj.Position,
+                            canQuery = obj.CanQuery,
+                            canTouch = obj.CanTouch,
+                            canCollide = obj.CanCollide,
+                            transparency = obj.Transparency,
+                            boneName = obj:GetAttribute("BoneName"),
+                            alwaysCollide = obj:GetAttribute("AlwaysCollide"),
+                        }
+                    end
+                end
+            end
+            return { model = model, folder = folder, parts = parts }
+        end
+        local function queryCopyState()
+            local folder = workspaceService:FindFirstChild("HitboxQueryCopies")
+            local entries = {}
+            if folder then
+                for _, obj in ipairs(folder:GetDescendants()) do
+                    local info = obj.ClassName .. " " .. obj:GetFullName()
+                    if obj:IsA("BasePart") then
+                        info = info .. " Size=" .. tostring(obj.Size)
+                            .. " CanQuery=" .. tostring(obj.CanQuery)
+                            .. " CanTouch=" .. tostring(obj.CanTouch)
+                            .. " CanCollide=" .. tostring(obj.CanCollide)
+                    end
+                    entries[#entries + 1] = info
+                end
+            end
+            return folder ~= nil, entries
         end
 
-        log("--- SUMMARY ---")
-        log("Descendants inventoried: " .. tostring(written) .. "/" .. tostring(total))
-        log("Names matching hitbox/combat clues: " .. tostring(relevant))
-        if written < total then
-            log("DETAILS TRUNCATED at " .. tostring(detailLimit) .. " entries to protect clipboard/memory.")
-        else
-            log("Details include every Workspace descendant.")
+        local cobraModels = getCobraModels()
+        for _, model in ipairs(cobraModels) do
+            tracked[model] = {
+                initial = snapshotModel(model),
+                maxSize = {},
+                minSize = {},
+                changes = {},
+                sampleCount = 0,
+                healthStart = (model:FindFirstChildOfClass("Humanoid") and model:FindFirstChildOfClass("Humanoid").Health) or nil,
+                healthEnd = nil,
+            }
+            local state = tracked[model]
+            for path, part in pairs(state.initial.parts) do
+                state.maxSize[path] = part.size
+                state.minSize[path] = part.size
+            end
         end
-        log("=== END WORKSPACE DIAGNOSTICS ===")
+        local copiesExists, copiesInitial = queryCopyState()
+        queryCopySnapshots.initial = copiesInitial
+        local localChar = LocalPlayer.Character
+        local localHumanoid = localChar and localChar:FindFirstChildOfClass("Humanoid")
+        local animator = localHumanoid and localHumanoid:FindFirstChildOfClass("Animator")
+
+        notify("Cobra collider scan", "Recording collider changes for 5 seconds. Attack during the scan!")
+        logEvent("START; HitboxEnabled=" .. tostring(Hit.on)
+            .. "; Multiplier=" .. tostring(Hit.mult)
+            .. "; LocalAnimal=" .. tostring(localChar and localChar:GetAttribute("AnimalName")))
+        logEvent("Cobra models tracked=" .. tostring(#cobraModels)
+            .. "; HitboxQueryCopies exists=" .. tostring(copiesExists)
+            .. "; initial entries=" .. tostring(#copiesInitial))
+
+        while tick() - startedAt < duration do
+            sampleCount = sampleCount + 1
+            local currentModels = getCobraModels()
+            for _, model in ipairs(currentModels) do
+                if not tracked[model] then
+                    tracked[model] = {
+                        initial = snapshotModel(model), maxSize = {}, minSize = {},
+                        changes = {}, sampleCount = 0,
+                        healthStart = (model:FindFirstChildOfClass("Humanoid") and model:FindFirstChildOfClass("Humanoid").Health) or nil,
+                    }
+                    for path, part in pairs(tracked[model].initial.parts) do
+                        tracked[model].maxSize[path] = part.size
+                        tracked[model].minSize[path] = part.size
+                    end
+                    logEvent("NEW COBRA model appeared: " .. model:GetFullName())
+                end
+            end
+
+            for model, state in pairs(tracked) do
+                if model and model.Parent then
+                    state.sampleCount = state.sampleCount + 1
+                    local current = snapshotModel(model)
+                    local hum = model:FindFirstChildOfClass("Humanoid")
+                    state.healthEnd = hum and hum.Health or state.healthEnd
+                    for path, part in pairs(current.parts) do
+                        if not state.initial.parts[path] then
+                            state.changes[#state.changes + 1] = "NEW COLLIDER " .. path .. " size=" .. tostring(part.size)
+                        else
+                            local old = state.initial.parts[path]
+                            local maxSize = state.maxSize[path] or old.size
+                            local minSize = state.minSize[path] or old.size
+                            state.maxSize[path] = Vector3.new(
+                                math.max(maxSize.X, part.size.X),
+                                math.max(maxSize.Y, part.size.Y),
+                                math.max(maxSize.Z, part.size.Z))
+                            state.minSize[path] = Vector3.new(
+                                math.min(minSize.X, part.size.X),
+                                math.min(minSize.Y, part.size.Y),
+                                math.min(minSize.Z, part.size.Z))
+                            if vectorChanged(old.size, part.size) then
+                                local key = "SIZE " .. path
+                                if not state.lastSize or state.lastSize[key] ~= tostring(part.size) then
+                                    state.changes[#state.changes + 1] = key .. " " .. tostring(old.size) .. " -> " .. tostring(part.size)
+                                    state.lastSize = state.lastSize or {}
+                                    state.lastSize[key] = tostring(part.size)
+                                end
+                            end
+                            if vectorChanged(old.position, part.position) then
+                                local key = "POSITION " .. path
+                                if not state.lastPosition or state.lastPosition[key] ~= tostring(part.position) then
+                                    state.changes[#state.changes + 1] = key .. " " .. tostring(old.position) .. " -> " .. tostring(part.position)
+                                    state.lastPosition = state.lastPosition or {}
+                                    state.lastPosition[key] = tostring(part.position)
+                                end
+                            end
+                            if old.canQuery ~= part.canQuery or old.canTouch ~= part.canTouch or old.canCollide ~= part.canCollide then
+                                state.changes[#state.changes + 1] = "FLAGS " .. path
+                                    .. " Query=" .. tostring(old.canQuery) .. "->" .. tostring(part.canQuery)
+                                    .. " Touch=" .. tostring(old.canTouch) .. "->" .. tostring(part.canTouch)
+                                    .. " Collide=" .. tostring(old.canCollide) .. "->" .. tostring(part.canCollide)
+                            end
+                        end
+                    end
+                    for path in pairs(state.initial.parts) do
+                        if not current.parts[path] then
+                            state.changes[#state.changes + 1] = "REMOVED COLLIDER " .. path
+                        end
+                    end
+                end
+            end
+
+            local existsNow, copyEntries = queryCopyState()
+            if #copyEntries ~= #queryCopySnapshots[#queryCopySnapshots] or existsNow ~= copiesExists then
+                logEvent("HitboxQueryCopies changed: exists=" .. tostring(existsNow)
+                    .. " entries=" .. tostring(#copyEntries))
+                for _, entry in ipairs(copyEntries) do logEvent("QUERY COPY " .. entry) end
+            end
+            queryCopySnapshots[#queryCopySnapshots + 1] = copyEntries
+
+            if animator then
+                local active = {}
+                for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                    if track.IsPlaying and track.Priority.Value >= Enum.AnimationPriority.Action.Value then
+                        active[#active + 1] = tostring(track.Name)
+                    end
+                end
+                if #active > 0 then logEvent("LOCAL ATTACK TRACKS={" .. table.concat(active, ",") .. "}") end
+            end
+            task.wait(sampleInterval)
+        end
+
+        local lines = {
+            "=== STIMMY COBRA COLLIDER ATTACK DIAGNOSTICS ===",
+            "Duration: " .. tostring(duration) .. " seconds",
+            "Samples: " .. tostring(sampleCount),
+            "Local player: " .. tostring(LocalPlayer.Name),
+            "Local animal: " .. tostring(LocalPlayer.Character and LocalPlayer.Character:GetAttribute("AnimalName")),
+            "Hitbox Expander enabled: " .. tostring(Hit.on),
+            "Multiplier: " .. tostring(Hit.mult),
+            "Cobra models tracked: " .. tostring(#cobraModels),
+            "HitboxQueryCopies existed initially: " .. tostring(copiesExists),
+            "Initial HitboxQueryCopies entries: " .. tostring(#copiesInitial),
+            "--- INITIAL QUERY COPY CONTENTS ---",
+        }
+        for _, entry in ipairs(copiesInitial) do lines[#lines + 1] = entry end
+        for model, state in pairs(tracked) do
+            lines[#lines + 1] = "--- COBRA MODEL: " .. model:GetFullName() .. " ---"
+            lines[#lines + 1] = "Initial collider count: " .. tostring((function() local n=0 for _ in pairs(state.initial.parts) do n=n+1 end return n end)())
+            lines[#lines + 1] = "Samples: " .. tostring(state.sampleCount)
+            lines[#lines + 1] = "Health: " .. tostring(state.healthStart) .. " -> " .. tostring(state.healthEnd)
+            for path, part in pairs(state.initial.parts) do
+                lines[#lines + 1] = "BASELINE " .. path
+                    .. " BoneName=" .. tostring(part.boneName)
+                    .. " Size=" .. tostring(part.size)
+                    .. " CanQuery=" .. tostring(part.canQuery)
+                    .. " CanTouch=" .. tostring(part.canTouch)
+                    .. " CanCollide=" .. tostring(part.canCollide)
+                    .. " AlwaysCollide=" .. tostring(part.alwaysCollide)
+                local maxSize = state.maxSize[path] or part.size
+                local minSize = state.minSize[path] or part.size
+                if vectorChanged(part.size, maxSize) or vectorChanged(part.size, minSize) then
+                    lines[#lines + 1] = "SIZE RANGE " .. path .. " min=" .. tostring(minSize) .. " max=" .. tostring(maxSize)
+                end
+            end
+            lines[#lines + 1] = "Collider changes captured: " .. tostring(#state.changes)
+            for _, change in ipairs(state.changes) do lines[#lines + 1] = change end
+        end
+        lines[#lines + 1] = "--- TIMELINE ---"
+        for _, event in ipairs(events) do lines[#lines + 1] = event end
+        local finalExists, finalCopies = queryCopyState()
+        lines[#lines + 1] = "--- FINAL HITBOXQUERYCOPIES ---"
+        lines[#lines + 1] = "Exists=" .. tostring(finalExists) .. " entries=" .. tostring(#finalCopies)
+        for _, entry in ipairs(finalCopies) do lines[#lines + 1] = entry end
+        lines[#lines + 1] = "=== END COBRA COLLIDER ATTACK DIAGNOSTICS ==="
 
         local report = table.concat(lines, "\n")
         print(report)
         if setclipboard then
             local copied = pcall(setclipboard, report)
             if copied then
-                notify("Workspace diagnostics", "Workspace inventory copied to clipboard.")
+                notify("Cobra collider scan", "Collider attack report copied to clipboard.")
             else
-                notify("Workspace diagnostics", "Copy failed. Report was printed to the executor console.")
+                notify("Cobra collider scan", "Copy failed. Report printed to console.")
             end
         else
-            notify("Workspace diagnostics", "Report printed to the executor console; clipboard API unavailable.")
+            notify("Cobra collider scan", "Report printed to console; clipboard API unavailable.")
         end
     end
 
     CombatTab:Button({
-        Title = "Copy Workspace Diagnostics",
+        Title = "Record Cobra Collider Changes (5s)",
         Callback = function()
             task.spawn(function()
                 local ok, err = pcall(runHitboxDiagnostics)
                 if not ok then
-                    warn("[Stimmy] Workspace diagnostics failed: " .. tostring(err))
-                    notify("Workspace diagnostics", "Scan failed: " .. tostring(err))
+                    warn("[Stimmy] Cobra collider diagnostics failed: " .. tostring(err))
+                    notify("Cobra collider scan", "Scan failed: " .. tostring(err))
                 end
             end)
         end,
