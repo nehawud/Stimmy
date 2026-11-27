@@ -3254,7 +3254,7 @@ do
     }
     end -- release the connection-list local before the latch feature allocates more locals
 
-    local Latch = (function()
+    Hit.Latch = (function()
     -- ---------- anti grab ----------
     local Latch = { on = false, delay = 0.1 }
     local LatchedRemote
@@ -3709,15 +3709,15 @@ do
         Title = "Anti Grab",
         Value = false,
         Flag = "AutoEscapeLatchOn",
-        Callback = function(v) Latch.on = v end,
+        Callback = function(v) Hit.Latch.on = v end,
     })
 
     CombatTab:Slider({
         Title = "Anti Grab Delay",
         Step = 0.05,
-        Value = { Min = 0, Max = 1, Default = Latch.delay },
+        Value = { Min = 0, Max = 1, Default = Hit.Latch.delay },
         Flag = "LatchEscapeDelay",
-        Callback = function(v) Latch.delay = math.clamp(v, 0, 1) end,
+        Callback = function(v) Hit.Latch.delay = math.clamp(v, 0, 1) end,
     })
 
     ;(function()
@@ -3889,7 +3889,7 @@ do
         Hit.on = false
         Aura.on = false
         AutoSpecial.on = false
-        Latch.on = false
+        Hit.Latch.on = false
         InfStam.on = false
         InfOxy.on = false
         if combatVitalsConn then combatVitalsConn:Disconnect() end
