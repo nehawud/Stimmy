@@ -3045,6 +3045,98 @@ do
         end,
     })
 
+    local function runHitboxDiagnostics()
+        local lines = {}
+        local function log(s)
+            lines[#lines + 1] = tostring(s)
+        end
+        local character = LocalPlayer.Character
+        log("=== STIMMY HITBOX DIAGNOSTICS ===")
+        log("Player: " .. LocalPlayer.Name)
+        log("AnimalName: " .. tostring(character and character:GetAttribute("AnimalName")))
+        log("Hitbox Expander enabled: " .. tostring(Hit.on))
+        log("Closest priority: " .. tostring(Hit.priorityClosest))
+        log("Multiplier: " .. tostring(Hit.mult))
+        log("Hitboxes module loaded: " .. tostring(Hitboxes ~= nil))
+        if character then
+            log("Character: " .. character:GetFullName())
+            for _, attr in ipairs({ "AnimalName", "BasicAttacksDisabled", "JumpsDisabled" }) do
+                log("Character attribute " .. attr .. ": " .. tostring(character:GetAttribute(attr)))
+            end
+        end
+        if Hitboxes then
+            for _, key in ipairs({ "GetDefinitions", "GetReach" }) do
+                log("Hitboxes." .. key .. " type: " .. type(Hitboxes[key]))
+            end
+            log("GetDefinitions currently wrapped: " .. tostring(Hitboxes.GetDefinitions ~= origGetDefs))
+            log("GetReach currently wrapped: " .. tostring(Hitboxes.GetReach ~= origGetReach))
+        end
+
+        local found, inspected = 0, 0
+        local ok, descendants = pcall(function() return game:GetDescendants() end)
+        if ok then
+            for _, obj in ipairs(descendants) do
+                if obj:IsA("ModuleScript") then
+                    local name = string.lower(obj.Name)
+                    local pathName = string.lower(obj:GetFullName())
+                    if string.find(name, "hit", 1, true) or string.find(name, "attack", 1, true)
+                        or string.find(name, "combat", 1, true) or string.find(name, "cobra", 1, true)
+                        or string.find(pathName, "cobra", 1, true) then
+                        found = found + 1
+                        if inspected < 80 then
+                            inspected = inspected + 1
+                            log("MODULE " .. obj:GetFullName())
+                            local required, exported = pcall(require, obj)
+                            if required and type(exported) == "table" then
+                                local keys = {}
+                                for k, v in pairs(exported) do
+                                    if type(k) == "string" and (type(v) == "function"
+                                        or string.find(string.lower(k), "hit", 1, true)
+                                        or string.find(string.lower(k), "reach", 1, true)
+                                        or string.find(string.lower(k), "attack", 1, true)
+                                        or string.find(string.lower(k), "cobra", 1, true)) then
+                                        keys[#keys + 1] = k .. ":" .. type(v)
+                                    end
+                                end
+                                table.sort(keys)
+                                log("  exports: " .. (#keys > 0 and table.concat(keys, ", ") or "(no relevant exports)"))
+                            elseif not required then
+                                log("  require failed: " .. tostring(exported))
+                            else
+                                log("  export type: " .. type(exported))
+                            end
+                        end
+                    end
+                end
+            end
+        else
+            log("GetDescendants failed: " .. tostring(descendants))
+        end
+        log("Matching ModuleScripts: " .. tostring(found) .. " (inspected " .. tostring(inspected) .. ")")
+        log("=== END DIAGNOSTICS ===")
+        local report = table.concat(lines, "\n")
+        print(report)
+        if setclipboard then
+            pcall(setclipboard, report)
+            notify("Hitbox diagnostics", "Scan complete. Report printed and copied to clipboard.")
+        else
+            notify("Hitbox diagnostics", "Scan complete. Report printed to the executor console.")
+        end
+    end
+
+    CombatTab:Button({
+        Title = "Scan Hitbox / Cobra Diagnostics",
+        Callback = function()
+            task.spawn(function()
+                local ok, err = pcall(runHitboxDiagnostics)
+                if not ok then
+                    warn("[Stimmy] Hitbox diagnostics failed: " .. tostring(err))
+                    notify("Hitbox diagnostics", "Scan failed: " .. tostring(err))
+                end
+            end)
+        end,
+    })
+
     CombatTab:Slider({
         Title = "Hitbox Size Multiplier",
         Step = 1,
