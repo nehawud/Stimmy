@@ -2567,23 +2567,75 @@ do
 
     -- ---------- shared: a searchable multi-select "safe" list of player names ----------
 
+    local function getWhitelistAnimalName(player)
+        local model = player and player.Character
+        if not model and player then model = workspace:FindFirstChild(player.Name) end
+        if not model then return nil end
+
+        local candidates = {}
+        for _, item in ipairs(model:GetDescendants()) do
+            if item:IsA("BillboardGui") then
+                for _, label in ipairs(item:GetDescendants()) do
+                    if label:IsA("TextLabel") or label:IsA("TextButton") then
+                        local value = tostring(label.Text or ""):gsub("^%s*(.-)%s*$", "%1")
+                        local lower = value:lower()
+                        if value ~= "" and #value <= 48
+                            and lower ~= player.Name:lower()
+                            and lower ~= player.DisplayName:lower()
+                            and not lower:find("gallimimus", 1, true)
+                            and not lower:find("juvenile", 1, true)
+                            and not lower:find("adult", 1, true)
+                            and not lower:find("female", 1, true)
+                            and not lower:find("male", 1, true) then
+                            local key = label.Name:lower()
+                            table.insert(candidates, {
+                                text = value,
+                                priority = (key:find("animal", 1, true) or key:find("name", 1, true)) and 0 or 1,
+                            })
+                        end
+                    end
+                end
+            end
+        end
+        table.sort(candidates, function(a, b) return a.priority < b.priority end)
+        if candidates[1] then return candidates[1].text end
+
+        for _, attribute in ipairs({ "AnimalDisplayName", "CustomName", "NameTag", "UniqueCharacterName", "AnimalName" }) do
+            local ok, value = pcall(function() return model:GetAttribute(attribute) end)
+            if ok and type(value) == "string" and value ~= "" then return value end
+        end
+        return nil
+    end
+
     local function newWhitelist(title, onAdded)
         local Safe = {}
         local shown = {}
+        local displayToPlayer = {}
+        local playerToDisplay = {}
         local muteUntil = 0
         local dd
         local lastSelectionKey = ""
 
         local function names()
             local rows, seen = {}, {}
+            table.clear(displayToPlayer)
+            table.clear(playerToDisplay)
             for _, pl in ipairs(Players:GetPlayers()) do
                 if pl ~= LocalPlayer then
-                    rows[#rows + 1] = pl.Name
+                    local animalName = getWhitelistAnimalName(pl)
+                    local display = animalName and (animalName .. " (@" .. pl.Name .. ")") or pl.Name
+                    rows[#rows + 1] = display
+                    displayToPlayer[display] = pl.Name
+                    playerToDisplay[pl.Name] = display
                     seen[pl.Name] = true
                 end
             end
-            for n in pairs(Safe) do
-                if not seen[n] then rows[#rows + 1] = n end
+            for name in pairs(Safe) do
+                if not seen[name] then
+                    rows[#rows + 1] = name
+                    displayToPlayer[name] = name
+                    playerToDisplay[name] = name
+                end
             end
             table.sort(rows, function(x, y) return x:lower() < y:lower() end)
             return rows
@@ -2591,17 +2643,17 @@ do
 
         local function selectionKey()
             local selected = {}
-            for n, enabled in pairs(Safe) do
-                if enabled then selected[#selected + 1] = n end
+            for name, enabled in pairs(Safe) do
+                if enabled then selected[#selected + 1] = name end
             end
             table.sort(selected)
-            return table.concat(selected, "\0")
+            return table.concat(selected, "\\0")
         end
 
         local function sameNames(a, b)
             if #a ~= #b then return false end
-            for i, n in ipairs(a) do
-                if b[i] ~= n then return false end
+            for i, name in ipairs(a) do
+                if b[i] ~= name then return false end
             end
             return true
         end
@@ -2611,22 +2663,20 @@ do
             local namesChanged = not sameNames(shown, freshNames)
             local freshSelectionKey = selectionKey()
             local selectionChanged = namesChanged or freshSelectionKey ~= lastSelectionKey
-
-            -- Avoid rebuilding the dropdown on whitelist-only changes. Rebuilding it
-            -- unnecessarily was clearing the user's active search text.
             if namesChanged then
                 shown = freshNames
                 muteUntil = tick() + 0.35
                 pcall(function() dd:Refresh(shown, true) end)
             end
             if selectionChanged then
-                local sel = {}
-                for _, n in ipairs(shown) do
-                    if Safe[n] then sel[#sel + 1] = n end
+                local selected = {}
+                for _, display in ipairs(shown) do
+                    local playerName = displayToPlayer[display]
+                    if playerName and Safe[playerName] then selected[#selected + 1] = display end
                 end
                 lastSelectionKey = freshSelectionKey
                 muteUntil = tick() + 0.35
-                pcall(function() dd:Select(sel) end)
+                pcall(function() dd:Select(selected) end)
             end
         end
 
@@ -2638,36 +2688,42 @@ do
             if tick() < muteUntil then return end
             local changed = false
             if type(opt) == "table" then
-                local sel = {}
-                for _, v in pairs(opt) do
-                    local n = type(v) == "table" and (v.Title or v.Name) or v
-                    if type(n) == "string" then sel[n] = true end
-                end
-                for n in pairs(sel) do
-                    if not Safe[n] then
-                        Safe[n] = true
-                        changed = true
-                        if onAdded then onAdded(n) end
+                local selected = {}
+                for _, value in pairs(opt) do
+                    local display = type(value) == "table" and (value.Title or value.Name) or value
+                    if type(display) == "string" then
+                        local playerName = displayToPlayer[display] or display
+                        selected[playerName] = true
                     end
                 end
-                for _, n in ipairs(shown) do
-                    if not sel[n] and Safe[n] then
-                        Safe[n] = nil
+                for name in pairs(selected) do
+                    if not Safe[name] then
+                        Safe[name] = true
+                        changed = true
+                        if onAdded then onAdded(name) end
+                    end
+                end
+                for name in pairs(Safe) do
+                    if playerToDisplay[name] and not selected[name] then
+                        Safe[name] = nil
                         changed = true
                     end
                 end
             elseif type(opt) == "string" and opt ~= "" then
-                if Safe[opt] then
-                    Safe[opt] = nil
-                    changed = true
+                local name = displayToPlayer[opt] or opt
+                if Safe[name] then
+                    Safe[name] = nil
                 else
-                    Safe[opt] = true
-                    changed = true
-                    if onAdded then onAdded(opt) end
+                    Safe[name] = true
+                    if onAdded then onAdded(name) end
                 end
+                changed = true
             end
             lastSelectionKey = selectionKey()
-            if changed then persist() end
+            if changed then
+                refresh()
+                persist()
+            end
         end
 
         shown = names()
@@ -2679,6 +2735,21 @@ do
             AllowNone = true,
             SearchBarEnabled = true,
             Callback = onSelect,
+        })
+
+        CombatTab:Button({
+            Title = "Remove All",
+            Callback = function()
+                local changed = false
+                for name in pairs(Safe) do
+                    Safe[name] = nil
+                    changed = true
+                end
+                if changed then
+                    refresh()
+                    persist()
+                end
+            end,
         })
 
         return Safe, refresh
