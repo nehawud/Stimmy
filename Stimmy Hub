@@ -2758,6 +2758,7 @@ do
     local Hit = {
         on = false, mult = 5, priorityClosest = true, preferredTarget = nil, targetScanAt = 0,
         diagnostics = false, diagSeenDefs = {}, diagSeenReach = {},
+        diagStats = { Definitions = 0, Reach = 0, CobraNamed = 0 },
     }
     local Hitboxes, origGetDefs, origGetReach = nil, nil, nil
     local ScaledCache = setmetatable({}, { __mode = "k" }) -- [original definitions] = { mult, list }
@@ -2838,25 +2839,28 @@ do
     end
 
     local function logCobraDefinitions(char, defs)
-        if not Hit.diagnostics or not isCobraForDiagnostics(char) or Hit.diagSeenDefs[char] then return end
+        if not Hit.diagnostics or typeof(char) ~= "Instance" or Hit.diagSeenDefs[char] then return end
         Hit.diagSeenDefs[char] = true
+        Hit.diagStats.Definitions = Hit.diagStats.Definitions + 1
         local ok, animalName = pcall(function() return char:GetAttribute("AnimalName") end)
-        warn("[HitboxDiag] Cobra GetDefinitions | model=" .. tostring(char:GetFullName())
+        local cobraNamed = isCobraForDiagnostics(char)
+        if cobraNamed then Hit.diagStats.CobraNamed = Hit.diagStats.CobraNamed + 1 end
+        warn("[HitboxDiag] GetDefinitions | cobraNameMatch=" .. tostring(cobraNamed)
+            .. " | model=" .. tostring(char:GetFullName())
+            .. " | class=" .. tostring(char.ClassName)
             .. " | AnimalName=" .. tostring(ok and animalName or nil)
             .. " | resultType=" .. typeof(defs)
             .. " | count=" .. tostring(type(defs) == "table" and #defs or "n/a"))
         if type(defs) == "table" then
             for index, definition in ipairs(defs) do
                 if type(definition) == "table" then
+                    local keys = {}
+                    for key in pairs(definition) do keys[#keys + 1] = tostring(key) end
+                    table.sort(keys)
                     warn("[HitboxDiag] Definition #" .. index
                         .. " | Size=" .. tostring(definition.Size)
                         .. " | AnchorRadius=" .. tostring(definition.AnchorRadius)
-                        .. " | keys=" .. table.concat((function()
-                            local keys = {}
-                            for key in pairs(definition) do keys[#keys + 1] = tostring(key) end
-                            table.sort(keys)
-                            return keys
-                        end)(), ","))
+                        .. " | keys=" .. table.concat(keys, ","))
                 else
                     warn("[HitboxDiag] Definition #" .. index .. " | type=" .. typeof(definition))
                 end
@@ -2865,9 +2869,12 @@ do
     end
 
     local function logCobraReach(char, reach)
-        if not Hit.diagnostics or not isCobraForDiagnostics(char) or Hit.diagSeenReach[char] then return end
+        if not Hit.diagnostics or typeof(char) ~= "Instance" or Hit.diagSeenReach[char] then return end
         Hit.diagSeenReach[char] = true
-        warn("[HitboxDiag] Cobra GetReach | model=" .. tostring(char:GetFullName())
+        Hit.diagStats.Reach = Hit.diagStats.Reach + 1
+        local cobraNamed = isCobraForDiagnostics(char)
+        warn("[HitboxDiag] GetReach | cobraNameMatch=" .. tostring(cobraNamed)
+            .. " | model=" .. tostring(char:GetFullName())
             .. " | baseReach=" .. tostring(reach)
             .. " | expanderEnabled=" .. tostring(Hit.on)
             .. " | multiplier=" .. tostring(Hit.mult))
@@ -3093,20 +3100,6 @@ do
                 end
                 Hit.on = true
             end)
-        end,
-    })
-
-    CombatTab:Toggle({
-        Title = "Cobra Hitbox Diagnostics",
-        Value = false,
-        Flag = "CobraHitboxDiagnostics",
-        Callback = function(v)
-            Hit.diagnostics = v
-            Hit.diagSeenDefs = {}
-            Hit.diagSeenReach = {}
-            if v then
-                notify("Cobra Diagnostics", "Turn on Hitbox Expander, then hit a Cobra once. Check the console for [HitboxDiag] logs.")
-            end
         end,
     })
 
@@ -5762,6 +5755,52 @@ updateAutoLoadLabel()
 
 local SettingsTab = Window:Tab({ Title = "Settings", Icon = "settings" })
 hook(SettingsTab)
+
+SettingsTab:Section({ Title = "Diagnostics" })
+
+SettingsTab:Paragraph({
+    Title = "Cobra Hitbox Diagnostics",
+    Content = "Records the character models passed into the game's hitbox functions, including models whose names do not contain Cobra. Enable this, reproduce one Cobra hit, then send the [HitboxDiag] console lines.",
+})
+
+SettingsTab:Toggle({
+    Title = "Enable Hitbox Diagnostics",
+    Value = false,
+    Flag = "CobraHitboxDiagnostics",
+    Callback = function(v)
+        Hit.diagnostics = v
+        Hit.diagSeenDefs = {}
+        Hit.diagSeenReach = {}
+        Hit.diagStats = { Definitions = 0, Reach = 0, CobraNamed = 0 }
+        if v then
+            notify("Hitbox Diagnostics", "Diagnostics enabled. Reproduce one Cobra hit, then check the Developer Console for [HitboxDiag] lines.")
+        else
+            notify("Hitbox Diagnostics", "Diagnostics paused.")
+        end
+    end,
+})
+
+SettingsTab:Button({
+    Title = "Print Diagnostics Summary",
+    Callback = function()
+        warn("[HitboxDiag] SUMMARY | GetDefinitions models=" .. tostring(Hit.diagStats.Definitions)
+            .. " | GetReach models=" .. tostring(Hit.diagStats.Reach)
+            .. " | Cobra name matches=" .. tostring(Hit.diagStats.CobraNamed)
+            .. " | expanderEnabled=" .. tostring(Hit.on)
+            .. " | multiplier=" .. tostring(Hit.mult))
+        notify("Hitbox Diagnostics", "Summary printed to Developer Console.")
+    end,
+})
+
+SettingsTab:Button({
+    Title = "Reset Diagnostics",
+    Callback = function()
+        Hit.diagSeenDefs = {}
+        Hit.diagSeenReach = {}
+        Hit.diagStats = { Definitions = 0, Reach = 0, CobraNamed = 0 }
+        notify("Hitbox Diagnostics", "Diagnostic counters reset.")
+    end,
+})
 
 -- ================= TAB 3: MENU (minimize key) =================
 WindowOpen = true
