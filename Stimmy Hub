@@ -2796,7 +2796,7 @@ do
     local function installCobraApiTrace()
         local H = Hitboxes
         if type(H) ~= "table" then return function() end end
-        local originals = {}
+        local originals, wrappers = {}, {}
         local unpackValues = table.unpack or unpack
         local function packValues(...)
             return { n = select("#", ...), ... }
@@ -2815,8 +2815,9 @@ do
         end
         for key, original in pairs(H) do
             if type(key) == "string" and type(original) == "function" then
-                originals[key] = original
-                H[key] = function(...)
+                local apiName, apiOriginal = key, original
+                originals[apiName] = apiOriginal
+                local wrapper = function(...)
                     local args = packValues(...)
                     local isCobraCall, argDescriptions = false, {}
                     for index = 1, args.n do
@@ -2824,36 +2825,35 @@ do
                         argDescriptions[#argDescriptions + 1] = tostring(index) .. "=" .. describe(value)
                         if isCobraCharacter(value) then isCobraCall = true end
                     end
-                    local relevantName = string.find(string.lower(key), "hit", 1, true)
-                        or string.find(string.lower(key), "reach", 1, true)
-                        or string.find(string.lower(key), "attack", 1, true)
-                        or string.find(string.lower(key), "definition", 1, true)
-                        or string.find(string.lower(key), "cobra", 1, true)
-                    local results = packValues(pcall(original, unpackValues(args, 1, args.n)))
+                    local lowerName = string.lower(apiName)
+                    local relevantName = string.find(lowerName, "hit", 1, true)
+                        or string.find(lowerName, "reach", 1, true)
+                        or string.find(lowerName, "attack", 1, true)
+                        or string.find(lowerName, "definition", 1, true)
+                        or string.find(lowerName, "cobra", 1, true)
+                    local results = packValues(pcall(apiOriginal, unpackValues(args, 1, args.n)))
                     if isCobraCall or relevantName then
                         if results[1] then
                             local returned = {}
                             for index = 2, math.min(results.n, 5) do
                                 returned[#returned + 1] = tostring(index - 1) .. "=" .. describe(results[index])
                             end
-                            recordCobraEvent("API " .. key .. "(" .. table.concat(argDescriptions, ",")
+                            recordCobraEvent("API " .. apiName .. "(" .. table.concat(argDescriptions, ",")
                                 .. ") -> " .. table.concat(returned, ","))
                         else
-                            recordCobraEvent("API " .. key .. " ERROR: " .. tostring(results[2]))
+                            recordCobraEvent("API " .. apiName .. " ERROR: " .. tostring(results[2]))
                         end
                     end
                     if not results[1] then error(results[2], 0) end
                     return unpackValues(results, 2, results.n)
                 end
+                wrappers[apiName] = wrapper
+                H[apiName] = wrapper
             end
         end
         return function()
             for key, original in pairs(originals) do
-                if type(H[key]) == "function" then
-                    -- Restore only if our tracing wrapper is still installed.
-                    local current = H[key]
-                    if current ~= original then H[key] = original end
-                end
+                if H[key] == wrappers[key] then H[key] = original end
             end
         end
     end
