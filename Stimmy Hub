@@ -2754,6 +2754,8 @@ do
         return Safe, refresh
     end
 
+    -- Hitbox Expander and Auto Special are isolated from the Combat tab's outer scope.
+    local HitFeature = (function()
     -- ---------- hitbox expander ----------
     local Hit = {
         on = false, mult = 5, priorityClosest = true, preferredTarget = nil, targetScanAt = 0,
@@ -3332,6 +3334,11 @@ do
     -- Picks a target itself (within a fixed range, by priority) and fires the attack remote directly,
     -- the same remote the game's own attack sends (AttackHandlerRemoteEvent:FireServer(humanoid)).
     -- No animation, no sound: just the server report, same as Auto Eat/Drink skip their animations.
+    return { state = Hit, removeOverrides = removeOverrides, autoSpecial = AutoSpecial }
+    end)()
+
+    -- Kill Aura is an independent feature scope.
+    local AuraFeature = (function()
     local AURA_RANGE = 30 -- fixed, not adjustable
     local Aura = { on = false, delay = 0.5 }
     -- Aura safe list is created below Kill Aura Priority.
@@ -3473,7 +3480,7 @@ do
         end
     end)
 
-    Hit.playerConnections = {
+    HitFeature.state.playerConnections = {
         Players.PlayerAdded:Connect((function()
             local queued = false
             return function()
@@ -3502,12 +3509,15 @@ do
         end)()),
     }
 
+    return { state = Aura }
+    end)()
+
     -- Anti Grab runs in its own function scope so its locals never consume
     -- registers from the large Combat tab scope.
     ;(function()
     -- ---------- anti grab ----------
     local Latch = { on = false, delay = 0.1 }
-    Hit.Latch = Latch
+    HitFeature.state.Latch = Latch
     local LatchedRemote
 
     local function getLatchRemote()
@@ -3576,6 +3586,8 @@ do
     end)()
 
 
+    -- Group/friend auto-whitelisting has its own local-register frame.
+    ;(function()
     local AutoWhitelistGroup = { on = false }
     CombatTab:Section({ Title = "Auto Whitelist" })
     CombatTab:Toggle({
@@ -3968,6 +3980,8 @@ do
         end
     end)
 
+    end)()
+
     ;(function()
     local PredatorAlert = { on = false, distanceMeters = 10, ignoredPlayers = {} }
     local predatorSound = Instance.new("Sound")
@@ -4134,16 +4148,15 @@ do
     end)()
 
     HitboxCleanup = function()
-        Hit.on = false
-        Aura.on = false
-        AutoSpecial.on = false
-        if Hit.Latch then Hit.Latch.on = false end
+        HitFeature.state.on = false
+        AuraFeature.state.on = false
+        HitFeature.autoSpecial.on = false
+        if HitFeature.state.Latch then HitFeature.state.Latch.on = false end
         InfStam.on = false
         InfOxy.on = false
         if combatVitalsConn then combatVitalsConn:Disconnect() end
-        removeOverrides()
-        if auraKeyConn then auraKeyConn:Disconnect() end
-        for _, c in ipairs(Hit.playerConnections or {}) do pcall(function() c:Disconnect() end) end
+        HitFeature.removeOverrides()
+        for _, c in ipairs(HitFeature.state.playerConnections or {}) do pcall(function() c:Disconnect() end) end
     end
 end
 
