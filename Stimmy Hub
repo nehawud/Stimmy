@@ -3938,6 +3938,7 @@ do
         glowOpacity = 50,
         tracers = false,
         name = false,
+        animalName = false,
         health = false,
         distance = false,
         info = false,
@@ -3984,6 +3985,7 @@ do
         return {
             box = newSquare(),
             name = newText(),
+            animalName = newText(),
             dist = newText(),
             info = newText(),
             healthBg = newLine(),
@@ -4176,6 +4178,43 @@ do
         ObjectESP.targets = {}
     end
 
+    -- Read the custom animal name from the player's overhead nameplate.
+    -- Fall back to known custom-name attributes when no overhead label is available.
+    local function getVisualAnimalName(player, character)
+        local model = character or player.Character or workspace:FindFirstChild(player.Name)
+        if not model then return nil end
+
+        local function clean(value)
+            if type(value) ~= "string" then return nil end
+            value = value:gsub("^%s*(.-)%s*$", "%1")
+            if value == "" or #value > 48 then return nil end
+            local lower = value:lower()
+            if lower == player.Name:lower() or lower == player.DisplayName:lower() then return nil end
+            if lower:find("gallimimus", 1, true) or lower:find("juvenile", 1, true)
+                or lower:find("adult", 1, true) or lower:find("female", 1, true)
+                or lower:find("male", 1, true) then return nil end
+            return value
+        end
+
+        for _, item in ipairs(model:GetDescendants()) do
+            if item:IsA("BillboardGui") then
+                for _, label in ipairs(item:GetDescendants()) do
+                    if label:IsA("TextLabel") or label:IsA("TextButton") then
+                        local value = clean(label.Text)
+                        if value then return value end
+                    end
+                end
+            end
+        end
+
+        for _, attribute in ipairs({ "AnimalDisplayName", "CustomName", "NameTag", "UniqueCharacterName" }) do
+            local ok, value = pcall(function() return model:GetAttribute(attribute) end)
+            value = ok and clean(value) or nil
+            if value then return value end
+        end
+        return nil
+    end
+
     -- ---------- per-player update: Model:GetBoundingBox() handles any animal's rig, no part names needed ----------
     local function updateFor(pl, o)
         local char = pl.Character
@@ -4302,11 +4341,30 @@ do
         end
 
         local aboveY = boxTop - ESP.textSize - 2
+        if ESP.animalName then
+            local animalName = getVisualAnimalName(pl, char)
+            if animalName then
+                o.animalName.Visible = true
+                o.animalName.Size = ESP.textSize
+                o.animalName.Color = Color3.fromRGB(255, 220, 120)
+                o.animalName.Position = Vector2.new(cx, aboveY)
+                o.animalName.Text = animalName
+            else
+                o.animalName.Visible = false
+            end
+        else
+            o.animalName.Visible = false
+        end
+
         if ESP.name then
             o.name.Visible = true
             o.name.Size = ESP.textSize
             o.name.Color = Color3.fromRGB(255, 255, 255)
-            o.name.Position = Vector2.new(cx, aboveY)
+            local nameY = aboveY
+            if ESP.animalName and o.animalName.Visible then
+                nameY = aboveY + ESP.textSize + 2
+            end
+            o.name.Position = Vector2.new(cx, nameY)
             o.name.Text = pl.Name
         else
             o.name.Visible = false
@@ -4460,6 +4518,13 @@ do
         Value = false,
         Flag = "ESPName",
         Callback = function(v) ESP.name = v end,
+    })
+
+    VisualsTab:Toggle({
+        Title = "Animal Name ESP",
+        Value = false,
+        Flag = "ESPAnimalName",
+        Callback = function(v) ESP.animalName = v end,
     })
 
     VisualsTab:Toggle({
