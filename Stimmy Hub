@@ -3284,6 +3284,15 @@ do
         end
         local copiesExists, copiesInitial = queryCopyState()
         queryCopySnapshots.initial = copiesInitial
+        local previousCopyExists = copiesExists
+        local previousCopyEntries = copiesInitial
+        local function copyEntriesChanged(previous, current)
+            if #previous ~= #current then return true end
+            for index, entry in ipairs(current) do
+                if previous[index] ~= entry then return true end
+            end
+            return false
+        end
         local localChar = LocalPlayer.Character
         local localHumanoid = localChar and localChar:FindFirstChildOfClass("Humanoid")
         local animator = localHumanoid and localHumanoid:FindFirstChildOfClass("Animator")
@@ -3368,11 +3377,13 @@ do
             end
 
             local existsNow, copyEntries = queryCopyState()
-            if #copyEntries ~= #queryCopySnapshots[#queryCopySnapshots] or existsNow ~= copiesExists then
+            if copyEntriesChanged(previousCopyEntries, copyEntries) or existsNow ~= previousCopyExists then
                 logEvent("HitboxQueryCopies changed: exists=" .. tostring(existsNow)
                     .. " entries=" .. tostring(#copyEntries))
                 for _, entry in ipairs(copyEntries) do logEvent("QUERY COPY " .. entry) end
             end
+            previousCopyExists = existsNow
+            previousCopyEntries = copyEntries
             queryCopySnapshots[#queryCopySnapshots + 1] = copyEntries
 
             if animator then
