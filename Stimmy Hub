@@ -2793,9 +2793,15 @@ do
 
     -- Temporarily trace every exported Hitboxes API function during the 5-second Cobra scan.
     -- Wrappers preserve all arguments, return values, and errors; originals are restored afterward.
+    local isCobraCharacter
     local function installCobraApiTrace()
         local H = Hitboxes
-        if type(H) ~= "table" then return function() end end
+        if type(H) ~= "table" then
+            recordCobraEvent("API TRACE unavailable: Hitboxes module is not loaded")
+            return function() end
+        end
+        local writable = pcall(function() if setreadonly then setreadonly(H, false) end end)
+        recordCobraEvent("API TRACE module loaded; setreadonly attempt=" .. tostring(writable))
         local originals, wrappers = {}, {}
         local unpackValues = table.unpack or unpack
         local function packValues(...)
@@ -2813,6 +2819,7 @@ do
             if kind == "string" then return string.sub(value, 1, 48) end
             return tostring(value)
         end
+        local wrapped, failed = 0, 0
         for key, original in pairs(H) do
             if type(key) == "string" and type(original) == "function" then
                 local apiName, apiOriginal = key, original
@@ -2848,17 +2855,31 @@ do
                     return unpackValues(results, 2, results.n)
                 end
                 wrappers[apiName] = wrapper
-                H[apiName] = wrapper
+                local assigned = pcall(function() H[apiName] = wrapper end)
+                if assigned and H[apiName] == wrapper then
+                    wrapped = wrapped + 1
+                else
+                    wrappers[apiName] = nil
+                    originals[apiName] = nil
+                    failed = failed + 1
+                end
             end
         end
+        recordCobraEvent("API TRACE installed wrappers=" .. tostring(wrapped) .. " failed=" .. tostring(failed))
         return function()
+            pcall(function() if setreadonly then setreadonly(H, false) end end)
+            local restored = 0
             for key, original in pairs(originals) do
-                if H[key] == wrappers[key] then H[key] = original end
+                if H[key] == wrappers[key] then
+                    local ok = pcall(function() H[key] = original end)
+                    if ok then restored = restored + 1 end
+                end
             end
+            recordCobraEvent("API TRACE restored=" .. tostring(restored))
         end
     end
 
-    local function isCobraCharacter(char)
+    isCobraCharacter = function(char)
         return typeof(char) == "Instance" and char:IsA("Model")
             and string.lower(cobraAnimalName(char)):find("cobra", 1, true) ~= nil
     end
