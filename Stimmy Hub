@@ -2478,6 +2478,8 @@ do
     local CombatTab = Window:Tab({ Title = "Combat", Icon = "swords" })
     hook(CombatTab)
 
+    -- Infinite stamina/oxygen is isolated into its own local frame.
+    local VitalsCleanup = (function()
     -- ---------- infinite stamina & oxygen: the client can set both directly and they stick (confirmed live) ----------
     local InfStam = { on = false }
     local InfOxy = { on = false }
@@ -2516,6 +2518,13 @@ do
             if v then applyInfOxy() end
         end,
     })
+
+    return function()
+        InfStam.on = false
+        InfOxy.on = false
+        if combatVitalsConn then combatVitalsConn:Disconnect() end
+    end
+    end)()
 
     do
         local function installNoFallDamageHook()
@@ -2567,6 +2576,8 @@ do
 
     -- ---------- shared: a searchable multi-select "safe" list of player names ----------
 
+    -- Safe-list UI and animal-name lookup have their own function-local register frame.
+    local NewWhitelistFactory = (function()
     local function getWhitelistAnimalName(player)
         local model = player and player.Character
         if not model and player then model = workspace:FindFirstChild(player.Name) end
@@ -2607,7 +2618,7 @@ do
         return nil
     end
 
-    local function newWhitelist(title, onAdded)
+    local function NewWhitelistFactory(title, onAdded)
         local Safe = {}
         local shown = {}
         local displayToPlayer = {}
@@ -2753,6 +2764,9 @@ do
 
         return Safe, refresh
     end
+
+    return newWhitelist
+    end)()
 
     -- Hitbox Expander and Auto Special are isolated from the Combat tab's outer scope.
     local HitFeature = (function()
@@ -3323,7 +3337,7 @@ do
             Hit.targetScanAt = 0
         end,
     })
-    HitSafe, refreshHitList = newWhitelist("Hitbox Safe Whitelist", function(name)
+    HitSafe, refreshHitList = NewWhitelistFactory("Hitbox Safe Whitelist", function(name)
         if AuraSafe and not AuraSafe[name] then
             AuraSafe[name] = true
             if refreshAuraList then refreshAuraList() end
@@ -3473,7 +3487,7 @@ do
         end,
     })
 
-    AuraSafe, refreshAuraList = newWhitelist("Kill Aura Safe Whitelist", function(name)
+    AuraSafe, refreshAuraList = NewWhitelistFactory("Kill Aura Safe Whitelist", function(name)
         if HitSafe and not HitSafe[name] then
             HitSafe[name] = true
             if refreshHitList then refreshHitList() end
@@ -4152,9 +4166,7 @@ do
         AuraFeature.state.on = false
         HitFeature.autoSpecial.on = false
         if HitFeature.state.Latch then HitFeature.state.Latch.on = false end
-        InfStam.on = false
-        InfOxy.on = false
-        if combatVitalsConn then combatVitalsConn:Disconnect() end
+        VitalsCleanup()
         HitFeature.removeOverrides()
         for _, c in ipairs(HitFeature.state.playerConnections or {}) do pcall(function() c:Disconnect() end) end
     end
