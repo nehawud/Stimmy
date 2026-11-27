@@ -2622,8 +2622,7 @@ do
             table.clear(playerToDisplay)
             for _, pl in ipairs(Players:GetPlayers()) do
                 if pl ~= LocalPlayer then
-                    local animalName = getWhitelistAnimalName(pl)
-                    local display = animalName and (animalName .. " (@" .. pl.Name .. ")") or pl.Name
+                    local display = pl.Name
                     rows[#rows + 1] = display
                     displayToPlayer[display] = pl.Name
                     playerToDisplay[pl.Name] = display
@@ -3321,16 +3320,6 @@ do
         end)()),
     }
 
-    -- Refresh displayed animal names periodically so changing animals updates both dropdowns.
-    task.spawn(function()
-        while alive do
-            task.wait(1.5)
-            if not alive then break end
-            if refreshHitList then pcall(refreshHitList) end
-            if refreshAuraList then pcall(refreshAuraList) end
-        end
-    end)
-
     local Latch = (function()
     -- ---------- anti grab ----------
     local Latch = { on = false, delay = 0.1 }
@@ -3666,148 +3655,119 @@ do
         end)()
     end)()
 
-    -- Isolate group-whitelist helpers in their own function register scope.
-    ;(function()
-        local function findCurrentGroupFrame()
+    -- Group whitelist runs in a single small worker scope to avoid main-chunk register pressure.
+    task.spawn(function()
+        local promptedGroupMembers = {}
+
+        local function scanGroupMembers()
             local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
             local statsGui = playerGui and playerGui:FindFirstChild("AnimalStatsScreenGui")
             local groupingFrame = statsGui and statsGui:FindFirstChild("GroupingFrame", true)
-            local myGroupFrame = groupingFrame and groupingFrame:FindFirstChild("MyGroupScrollingFrame", true)
-            return myGroupFrame and myGroupFrame:FindFirstChild("InGroupFrame", true)
-        end
+            local scrollingFrame = groupingFrame and groupingFrame:FindFirstChild("MyGroupScrollingFrame", true)
+            local inGroupFrame = scrollingFrame and scrollingFrame:FindFirstChild("InGroupFrame", true)
+            if not inGroupFrame then return nil end
 
-        local function addGroupAttributeValues(item, textValues, userIds)
-            for key, value in pairs(item:GetAttributes()) do
-                local keyLower = string.lower(tostring(key))
-                local isMemberKey = keyLower:find("user", 1, true)
-                    or keyLower:find("player", 1, true)
-                    or keyLower:find("member", 1, true)
-                    or keyLower:find("name", 1, true)
-                if isMemberKey then
-                    if type(value) == "number" then
-                        userIds[value] = true
-                    elseif type(value) == "string" and value ~= "" then
-                        textValues[#textValues + 1] = string.lower(value)
+            local textValues, playerValues, userIds = {}, {}, {}
+            for _, item in ipairs(inGroupFrame:GetDescendants()) do
+                if item:IsA("ObjectValue") and item.Value and item.Value:IsA("Player") then
+                    playerValues[item.Value.Name] = true
+                elseif item:IsA("IntValue") or item:IsA("NumberValue") then
+                    userIds[item.Value] = true
+                elseif item:IsA("StringValue") and item.Value ~= "" then
+                    textValues[#textValues + 1] = string.lower(item.Value)
+                end
+                if item.Name and item.Name ~= "" then
+                    textValues[#textValues + 1] = string.lower(item.Name)
+                end
+                if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
+                    local labelText = ""
+                    pcall(function() labelText = item.Text end)
+                    if labelText ~= "" then textValues[#textValues + 1] = string.lower(labelText) end
+                end
+                for key, value in pairs(item:GetAttributes()) do
+                    local keyLower = string.lower(tostring(key))
+                    if keyLower:find("user", 1, true) or keyLower:find("player", 1, true)
+                        or keyLower:find("member", 1, true) or keyLower:find("name", 1, true) then
+                        if type(value) == "number" then
+                            userIds[value] = true
+                        elseif type(value) == "string" and value ~= "" then
+                            textValues[#textValues + 1] = string.lower(value)
+                        end
                     end
                 end
             end
-        end
 
-        local function addGroupItemValues(item, textValues, playerValues, userIds)
-            if item:IsA("ObjectValue") and item.Value and item.Value:IsA("Player") then
-                playerValues[item.Value.Name] = true
-            elseif (item:IsA("IntValue") or item:IsA("NumberValue")) and type(item.Value) == "number" then
-                userIds[item.Value] = true
-            elseif item:IsA("StringValue") and item.Value ~= "" then
-                textValues[#textValues + 1] = string.lower(item.Value)
-            end
-            if item.Name and item.Name ~= "" then
-                textValues[#textValues + 1] = string.lower(item.Name)
-            end
-            if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
-                local labelText = ""
-                pcall(function() labelText = item.Text end)
-                if labelText ~= "" then
-                    textValues[#textValues + 1] = string.lower(labelText)
-                end
-            end
-            addGroupAttributeValues(item, textValues, userIds)
-        end
-
-        local function collectGroupIdentifiers(inGroupFrame)
-            local identifiers = { Text = {}, Players = {}, UserIds = {} }
-            for _, item in ipairs(inGroupFrame:GetDescendants()) do
-                addGroupItemValues(item, identifiers.Text, identifiers.Players, identifiers.UserIds)
-            end
-            return identifiers
-        end
-
-        local function playerMatchesGroupIdentifiers(player, identifiers)
-            if identifiers.Players[player.Name] or identifiers.UserIds[player.UserId] then
-                return true
-            end
-            local name = string.lower(player.Name)
-            local displayName = string.lower(player.DisplayName)
-            for _, value in ipairs(identifiers.Text) do
-                if string.find(value, name, 1, true)
-                    or (displayName ~= "" and string.find(value, displayName, 1, true)) then
-                    return true
-                end
-            end
-            return false
-        end
-
-        local function getCurrentGroupMembers()
-            local inGroupFrame = findCurrentGroupFrame()
-            if not inGroupFrame then return nil end
-            local identifiers = collectGroupIdentifiers(inGroupFrame)
             local members = {}
             for _, player in ipairs(Players:GetPlayers()) do
-                if player ~= LocalPlayer and playerMatchesGroupIdentifiers(player, identifiers) then
-                    members[player.Name] = true
+                if player ~= LocalPlayer then
+                    local matched = playerValues[player.Name] or userIds[player.UserId]
+                    if not matched then
+                        local username = string.lower(player.Name)
+                        local displayName = string.lower(player.DisplayName)
+                        for _, value in ipairs(textValues) do
+                            if value:find(username, 1, true)
+                                or (displayName ~= "" and value:find(displayName, 1, true)) then
+                                matched = true
+                                break
+                            end
+                        end
+                    end
+                    if matched then members[player.Name] = true end
                 end
             end
             return members
         end
 
-        local promptedGroupMembers = {}
-        local function promptToWhitelistGroupMember(player)
-            local playerName = player.Name
-            pcall(function()
-                WindUI:Notify({
-                    Title = "Group Member Detected",
-                    Content = "Would you like to whitelist " .. playerName .. "?",
-                    Duration = 10,
-                    Buttons = {
-                        {
-                            Title = "✓",
-                            Callback = function()
-                                if not AutoWhitelistGroup.on or not promptedGroupMembers[playerName]
-                                    or player.Parent ~= Players then return end
-                                local liveMembers = getCurrentGroupMembers()
-                                if not liveMembers or not liveMembers[playerName] then return end
-                                local addedHit, addedAura = false, false
-                                if not HitSafe[playerName] then HitSafe[playerName] = true; addedHit = true end
-                                if not AuraSafe[playerName] then AuraSafe[playerName] = true; addedAura = true end
-                                GroupAutoAddedOwnership[playerName] = {
-                                    Hitbox = addedHit,
-                                    KillAura = addedAura,
-                                }
-                                if refreshHitList then refreshHitList() end
-                                if refreshAuraList then refreshAuraList() end
-                                if ConfigReady then task.defer(saveServerSafeLists) end
-                            end,
-                        },
-                        { Title = "✕", Callback = function() end },
-                    },
-                })
-            end)
-        end
-    
-        task.spawn(function()
-            while alive do
-                task.wait(0.75)
-                local ok, members = pcall(getCurrentGroupMembers)
-                if not ok then
-                    warn("[AnimalFarm] group membership scan error: " .. tostring(members))
-                    members = nil
-                end
-                if not AutoWhitelistGroup.on then
-                    table.clear(promptedGroupMembers)
-                elseif members then
-                    for playerName in pairs(members) do
-                        if not promptedGroupMembers[playerName] then
-                            local player = Players:FindFirstChild(playerName)
-                            if player then
-                                promptedGroupMembers[playerName] = true
-                                promptToWhitelistGroupMember(player)
-                            end
+        while alive do
+            task.wait(0.75)
+            local ok, members = pcall(scanGroupMembers)
+            if not ok then
+                warn("[AnimalFarm] group membership scan error: " .. tostring(members))
+                members = nil
+            end
+            if not AutoWhitelistGroup.on then
+                table.clear(promptedGroupMembers)
+            elseif members then
+                for playerName in pairs(members) do
+                    if not promptedGroupMembers[playerName] then
+                        local player = Players:FindFirstChild(playerName)
+                        if player then
+                            promptedGroupMembers[playerName] = true
+                            pcall(function()
+                                WindUI:Notify({
+                                    Title = "Group Member Detected",
+                                    Content = "Would you like to whitelist " .. playerName .. "?",
+                                    Duration = 10,
+                                    Buttons = {
+                                        {
+                                            Title = "✓",
+                                            Callback = function()
+                                                if not AutoWhitelistGroup.on or not promptedGroupMembers[playerName]
+                                                    or player.Parent ~= Players then return end
+                                                local currentMembers = scanGroupMembers()
+                                                if not currentMembers or not currentMembers[playerName] then return end
+                                                local addedHit, addedAura = false, false
+                                                if not HitSafe[playerName] then HitSafe[playerName] = true; addedHit = true end
+                                                if not AuraSafe[playerName] then AuraSafe[playerName] = true; addedAura = true end
+                                                GroupAutoAddedOwnership[playerName] = {
+                                                    Hitbox = addedHit,
+                                                    KillAura = addedAura,
+                                                }
+                                                if refreshHitList then refreshHitList() end
+                                                if refreshAuraList then refreshAuraList() end
+                                                if ConfigReady then task.defer(saveServerSafeLists) end
+                                            end,
+                                        },
+                                        { Title = "✕", Callback = function() end },
+                                    },
+                                })
+                            end)
                         end
                     end
                 end
             end
-        end)
-    end)()
+        end
+    end)
 
     CombatTab:Section({ Title = "Anti Grab" })
 
