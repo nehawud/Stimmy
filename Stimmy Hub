@@ -3267,7 +3267,7 @@ do
                     lines[#lines + 1] = "No Cobra player samples or Hitboxes API calls captured."
                 end
                 lines[#lines + 1] = "=== END RECORDING ==="
-                local report = table.concat(lines, "\\n")
+                local report = table.concat(lines, "\n")
                 print(report)
                 if setclipboard then
                     pcall(setclipboard, report)
