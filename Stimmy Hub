@@ -3437,6 +3437,7 @@ do
         end
     end)
 
+    do
     local plConns = {
         Players.PlayerAdded:Connect((function()
             local queued = false
@@ -3465,6 +3466,7 @@ do
             end
         end)()),
     }
+    end -- release the connection-list local before the latch feature allocates more locals
 
     local Latch = (function()
     -- ---------- anti grab ----------
