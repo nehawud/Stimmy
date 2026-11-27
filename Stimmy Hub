@@ -3072,6 +3072,46 @@ do
             log("GetReach currently wrapped: " .. tostring(Hitboxes.GetReach ~= origGetReach))
         end
 
+        -- Compare original and expanded hitbox data for each live player target.
+        local myRoot = character and character:FindFirstChild("HumanoidRootPart")
+        local preferred = getPreferredHitTarget()
+        log("Preferred target: " .. tostring(preferred and preferred.Name))
+        if Hitboxes and origGetDefs and origGetReach then
+            for _, player in ipairs(Players:GetPlayers()) do
+                if player ~= LocalPlayer and player.Character then
+                    local target = player.Character
+                    local animal = target:GetAttribute("AnimalName")
+                    local root = target:FindFirstChild("HumanoidRootPart")
+                    local distance = myRoot and root and (root.Position - myRoot.Position).Magnitude
+                    log("TARGET " .. player.Name .. " animal=" .. tostring(animal)
+                        .. " distance=" .. tostring(distance)
+                        .. " safe=" .. tostring(isHitSafe(target))
+                        .. " closest=" .. tostring(target == preferred))
+                    local baseOk, baseDefs = pcall(origGetDefs, target)
+                    local expandedOk, expandedDefs = pcall(Hitboxes.GetDefinitions, target)
+                    log("  definitions original=" .. tostring(baseOk and type(baseDefs) == "table" and #baseDefs or baseDefs)
+                        .. " expanded=" .. tostring(expandedOk and type(expandedDefs) == "table" and #expandedDefs or expandedDefs))
+                    if baseOk and expandedOk and type(baseDefs) == "table" and type(expandedDefs) == "table" then
+                        for index, def in ipairs(baseDefs) do
+                            local expanded = expandedDefs[index]
+                            if expanded then
+                                log("  def[" .. index .. "] size " .. tostring(def.Size)
+                                    .. " -> " .. tostring(expanded.Size)
+                                    .. " anchor " .. tostring(def.AnchorRadius)
+                                    .. " -> " .. tostring(expanded.AnchorRadius))
+                            end
+                        end
+                    end
+                    local reachOk, baseReach = pcall(origGetReach, target)
+                    local expandedReachOk, expandedReach = pcall(Hitboxes.GetReach, target)
+                    log("  reach original=" .. tostring(reachOk and baseReach or baseReach)
+                        .. " expanded=" .. tostring(expandedReachOk and expandedReach or expandedReach))
+                end
+            end
+        else
+            log("Live target comparison skipped: original hitbox functions unavailable.")
+        end
+
         local found, inspected = 0, 0
         local ok, descendants = pcall(function() return game:GetDescendants() end)
         if ok then
