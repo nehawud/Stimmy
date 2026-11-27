@@ -2756,7 +2756,10 @@ do
     end
 
     -- ---------- hitbox expander ----------
-    local Hit = { on = false, mult = 5, priorityClosest = true, preferredTarget = nil, targetScanAt = 0 }
+    local Hit = {
+        on = false, mult = 5, priorityClosest = true, preferredTarget = nil, targetScanAt = 0,
+        diagnostics = false, diagSeenDefs = {}, diagSeenReach = {},
+    }
     local Hitboxes, origGetDefs, origGetReach = nil, nil, nil
     local ScaledCache = setmetatable({}, { __mode = "k" }) -- [original definitions] = { mult, list }
 
@@ -2827,6 +2830,50 @@ do
         return list
     end
 
+    local function isCobraForDiagnostics(char)
+        if typeof(char) ~= "Instance" then return false end
+        local ok, animalName = pcall(function() return char:GetAttribute("AnimalName") end)
+        local modelName = tostring(char.Name or "")
+        return (type(animalName) == "string" and animalName:lower():find("cobra", 1, true) ~= nil)
+            or modelName:lower():find("cobra", 1, true) ~= nil
+    end
+
+    local function logCobraDefinitions(char, defs)
+        if not Hit.diagnostics or not isCobraForDiagnostics(char) or Hit.diagSeenDefs[char] then return end
+        Hit.diagSeenDefs[char] = true
+        local ok, animalName = pcall(function() return char:GetAttribute("AnimalName") end)
+        warn("[HitboxDiag] Cobra GetDefinitions | model=" .. tostring(char:GetFullName())
+            .. " | AnimalName=" .. tostring(ok and animalName or nil)
+            .. " | resultType=" .. typeof(defs)
+            .. " | count=" .. tostring(type(defs) == "table" and #defs or "n/a"))
+        if type(defs) == "table" then
+            for index, definition in ipairs(defs) do
+                if type(definition) == "table" then
+                    warn("[HitboxDiag] Definition #" .. index
+                        .. " | Size=" .. tostring(definition.Size)
+                        .. " | AnchorRadius=" .. tostring(definition.AnchorRadius)
+                        .. " | keys=" .. table.concat((function()
+                            local keys = {}
+                            for key in pairs(definition) do keys[#keys + 1] = tostring(key) end
+                            table.sort(keys)
+                            return keys
+                        end)(), ","))
+                else
+                    warn("[HitboxDiag] Definition #" .. index .. " | type=" .. typeof(definition))
+                end
+            end
+        end
+    end
+
+    local function logCobraReach(char, reach)
+        if not Hit.diagnostics or not isCobraForDiagnostics(char) or Hit.diagSeenReach[char] then return end
+        Hit.diagSeenReach[char] = true
+        warn("[HitboxDiag] Cobra GetReach | model=" .. tostring(char:GetFullName())
+            .. " | baseReach=" .. tostring(reach)
+            .. " | expanderEnabled=" .. tostring(Hit.on)
+            .. " | multiplier=" .. tostring(Hit.mult))
+    end
+
     local function installOverrides()
         local H = Hitboxes
         pcall(function() if setreadonly then setreadonly(H, false) end end)
@@ -2836,6 +2883,9 @@ do
         return pcall(function()
             H.GetDefinitions = function(char, ...)
                 local defs = gd(char, ...)
+                if typeof(char) == "Instance" and char ~= LocalPlayer.Character then
+                    logCobraDefinitions(char, defs)
+                end
                 if Hit.on and Hit.mult > 1 and type(defs) == "table" and typeof(char) == "Instance"
                     and char ~= LocalPlayer.Character and not isHitSafe(char) then
                     return scaledDefs(defs)
@@ -2844,6 +2894,9 @@ do
             end
             H.GetReach = function(char, ...)
                 local r = gr(char, ...)
+                if typeof(char) == "Instance" and char ~= LocalPlayer.Character then
+                    logCobraReach(char, r)
+                end
                 if r and isPreferredHitTarget(char) then
                     return r * Hit.mult
                 end
@@ -3041,6 +3094,20 @@ do
                 end
                 Hit.on = true
             end)
+        end,
+    })
+
+    CombatTab:Toggle({
+        Title = "Cobra Hitbox Diagnostics",
+        Value = false,
+        Flag = "CobraHitboxDiagnostics",
+        Callback = function(v)
+            Hit.diagnostics = v
+            Hit.diagSeenDefs = {}
+            Hit.diagSeenReach = {}
+            if v then
+                notify("Cobra Diagnostics", "Turn on Hitbox Expander, then hit a Cobra once. Check the console for [HitboxDiag] logs.")
+            end
         end,
     })
 
