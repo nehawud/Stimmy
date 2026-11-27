@@ -3667,7 +3667,7 @@ do
     end)()
 
     -- Keep group-whitelist locals isolated from the main script scope to avoid Luau's 200-register limit.
-    (function()
+    ;(function()
         local function getCurrentGroupMembers()
             local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
             local statsGui = playerGui and playerGui:FindFirstChild("AnimalStatsScreenGui")
