@@ -2760,6 +2760,26 @@ do
     }
     local Hitboxes, origGetDefs, origGetReach = nil, nil, nil
     local ScaledCache = setmetatable({}, { __mode = "k" }) -- [original definitions] = { mult, list }
+    local CobraRecorder = { active = false, started = 0, events = {}, maxEvents = 180 }
+
+    local function cobraAnimalName(char)
+        if not char then return "?" end
+        local ok, value = pcall(function() return char:GetAttribute("AnimalName") end)
+        if ok and type(value) == "string" and value ~= "" then return value end
+        return char.Name
+    end
+
+    local function recordCobraEvent(message)
+        if not CobraRecorder.active or #CobraRecorder.events >= CobraRecorder.maxEvents then return end
+        local elapsed = tick() - CobraRecorder.started
+        CobraRecorder.events[#CobraRecorder.events + 1] = string.format("[+%.3fs] %s", elapsed, tostring(message))
+    end
+
+    local function isCobraCharacter(char)
+        return typeof(char) == "Instance" and char:IsA("Model")
+            and string.lower(cobraAnimalName(char)):find("cobra", 1, true) ~= nil
+    end
+
     -- Hitbox and aura safe lists are declared above for additive sync.
 
     local function isHitSafe(char)
@@ -2839,12 +2859,34 @@ do
                 local shouldScale = Hit.on and Hit.mult > 1 and type(defs) == "table"
                     and typeof(char) == "Instance" and char ~= LocalPlayer.Character and not isHitSafe(char)
                 local result = shouldScale and scaledDefs(defs) or defs
+                if isCobraCharacter(char) then
+                    local function sizes(list)
+                        local out = {}
+                        if type(list) == "table" then
+                            for i, def in ipairs(list) do
+                                out[#out + 1] = tostring(i) .. ":" .. tostring(def.Size)
+                                    .. "/anchor=" .. tostring(def.AnchorRadius)
+                            end
+                        end
+                        return #out > 0 and table.concat(out, "; ") or "(none)"
+                    end
+                    recordCobraEvent("GetDefinitions called; enabled=" .. tostring(Hit.on)
+                        .. " mult=" .. tostring(Hit.mult) .. " safe=" .. tostring(isHitSafe(char))
+                        .. " preferred=" .. tostring(getPreferredHitTarget() == char)
+                        .. " original={" .. sizes(defs) .. "} returned={" .. sizes(result) .. "}")
+                end
                 return result
             end
             H.GetReach = function(char, ...)
                 local r = gr(char, ...)
                 local preferred = isPreferredHitTarget(char)
                 local result = (r and preferred) and (r * Hit.mult) or r
+                if isCobraCharacter(char) then
+                    recordCobraEvent("GetReach called; enabled=" .. tostring(Hit.on)
+                        .. " closestPriority=" .. tostring(Hit.priorityClosest)
+                        .. " preferred=" .. tostring(preferred) .. " original=" .. tostring(r)
+                        .. " returned=" .. tostring(result))
+                end
                 return result
             end
         end)
@@ -3042,6 +3084,214 @@ do
         end,
     })
 
+    local function runHitboxDiagnostics()
+        local lines = {}
+        local function log(s)
+            lines[#lines + 1] = tostring(s)
+        end
+        local character = LocalPlayer.Character
+        log("=== STIMMY HITBOX DIAGNOSTICS ===")
+        log("Player: " .. LocalPlayer.Name)
+        log("AnimalName: " .. tostring(character and character:GetAttribute("AnimalName")))
+        log("Hitbox Expander enabled: " .. tostring(Hit.on))
+        log("Closest priority: " .. tostring(Hit.priorityClosest))
+        log("Multiplier: " .. tostring(Hit.mult))
+        log("Hitboxes module loaded: " .. tostring(Hitboxes ~= nil))
+        if character then
+            log("Character: " .. character:GetFullName())
+            for _, attr in ipairs({ "AnimalName", "BasicAttacksDisabled", "JumpsDisabled" }) do
+                log("Character attribute " .. attr .. ": " .. tostring(character:GetAttribute(attr)))
+            end
+        end
+        if Hitboxes then
+            for _, key in ipairs({ "GetDefinitions", "GetReach" }) do
+                log("Hitboxes." .. key .. " type: " .. type(Hitboxes[key]))
+            end
+            log("GetDefinitions currently wrapped: " .. tostring(Hitboxes.GetDefinitions ~= origGetDefs))
+            log("GetReach currently wrapped: " .. tostring(Hitboxes.GetReach ~= origGetReach))
+        end
+
+        -- Compare original and expanded hitbox data for each live player target.
+        local myRoot = character and character:FindFirstChild("HumanoidRootPart")
+        local preferred = getPreferredHitTarget()
+        log("Preferred target: " .. tostring(preferred and preferred.Name))
+        if Hitboxes and origGetDefs and origGetReach then
+            for _, player in ipairs(Players:GetPlayers()) do
+                if player ~= LocalPlayer and player.Character then
+                    local target = player.Character
+                    local animal = target:GetAttribute("AnimalName")
+                    local root = target:FindFirstChild("HumanoidRootPart")
+                    local distance = myRoot and root and (root.Position - myRoot.Position).Magnitude
+                    log("TARGET " .. player.Name .. " animal=" .. tostring(animal)
+                        .. " distance=" .. tostring(distance)
+                        .. " safe=" .. tostring(isHitSafe(target))
+                        .. " closest=" .. tostring(target == preferred))
+                    local baseOk, baseDefs = pcall(origGetDefs, target)
+                    local expandedOk, expandedDefs = pcall(Hitboxes.GetDefinitions, target)
+                    log("  definitions original=" .. tostring(baseOk and type(baseDefs) == "table" and #baseDefs or baseDefs)
+                        .. " expanded=" .. tostring(expandedOk and type(expandedDefs) == "table" and #expandedDefs or expandedDefs))
+                    if baseOk and expandedOk and type(baseDefs) == "table" and type(expandedDefs) == "table" then
+                        for index, def in ipairs(baseDefs) do
+                            local expanded = expandedDefs[index]
+                            if expanded then
+                                log("  def[" .. index .. "] size " .. tostring(def.Size)
+                                    .. " -> " .. tostring(expanded.Size)
+                                    .. " anchor " .. tostring(def.AnchorRadius)
+                                    .. " -> " .. tostring(expanded.AnchorRadius))
+                            end
+                        end
+                    end
+                    local reachOk, baseReach = pcall(origGetReach, target)
+                    local expandedReachOk, expandedReach = pcall(Hitboxes.GetReach, target)
+                    log("  reach original=" .. tostring(reachOk and baseReach or baseReach)
+                        .. " expanded=" .. tostring(expandedReachOk and expandedReach or expandedReach))
+                end
+            end
+        else
+            log("Live target comparison skipped: original hitbox functions unavailable.")
+        end
+
+        local found, inspected = 0, 0
+        local ok, descendants = pcall(function() return game:GetDescendants() end)
+        if ok then
+            for _, obj in ipairs(descendants) do
+                if obj:IsA("ModuleScript") then
+                    local name = string.lower(obj.Name)
+                    local pathName = string.lower(obj:GetFullName())
+                    if string.find(name, "hit", 1, true) or string.find(name, "attack", 1, true)
+                        or string.find(name, "combat", 1, true) or string.find(name, "cobra", 1, true)
+                        or string.find(pathName, "cobra", 1, true) then
+                        found = found + 1
+                        if inspected < 80 then
+                            inspected = inspected + 1
+                            log("MODULE " .. obj:GetFullName())
+                            local required, exported = pcall(require, obj)
+                            if required and type(exported) == "table" then
+                                local keys = {}
+                                for k, v in pairs(exported) do
+                                    if type(k) == "string" and (type(v) == "function"
+                                        or string.find(string.lower(k), "hit", 1, true)
+                                        or string.find(string.lower(k), "reach", 1, true)
+                                        or string.find(string.lower(k), "attack", 1, true)
+                                        or string.find(string.lower(k), "cobra", 1, true)) then
+                                        keys[#keys + 1] = k .. ":" .. type(v)
+                                    end
+                                end
+                                table.sort(keys)
+                                log("  exports: " .. (#keys > 0 and table.concat(keys, ", ") or "(no relevant exports)"))
+                            elseif not required then
+                                log("  require failed: " .. tostring(exported))
+                            else
+                                log("  export type: " .. type(exported))
+                            end
+                        end
+                    end
+                end
+            end
+        else
+            log("GetDescendants failed: " .. tostring(descendants))
+        end
+        log("Matching ModuleScripts: " .. tostring(found) .. " (inspected " .. tostring(inspected) .. ")")
+        log("=== END DIAGNOSTICS ===")
+        local report = table.concat(lines, "\n")
+        print(report)
+        if setclipboard then
+            pcall(setclipboard, report)
+            notify("Hitbox diagnostics", "Scan complete. Report printed and copied to clipboard.")
+        else
+            notify("Hitbox diagnostics", "Scan complete. Report printed to the executor console.")
+        end
+    end
+
+    CombatTab:Button({
+        Title = "Scan Hitbox / Cobra Diagnostics",
+        Callback = function()
+            task.spawn(function()
+                local ok, err = pcall(runHitboxDiagnostics)
+                if not ok then
+                    warn("[Stimmy] Hitbox diagnostics failed: " .. tostring(err))
+                    notify("Hitbox diagnostics", "Scan failed: " .. tostring(err))
+                end
+            end)
+        end,
+    })
+
+    CombatTab:Button({
+        Title = "Record Cobra Attack Scan (5s)",
+        Callback = function()
+            if CobraRecorder.active then
+                notify("Cobra recorder", "A scan is already running.")
+                return
+            end
+            CobraRecorder.events = {}
+            CobraRecorder.started = tick()
+            CobraRecorder.active = true
+            recordCobraEvent("START; HitboxEnabled=" .. tostring(Hit.on)
+                .. "; ClosestPriority=" .. tostring(Hit.priorityClosest)
+                .. "; Multiplier=" .. tostring(Hit.mult))
+            notify("Cobra recorder", "Recording for 5 seconds. Attack the Cobra now!")
+
+            task.spawn(function()
+                local finishAt = CobraRecorder.started + 5
+                while alive and CobraRecorder.active and tick() < finishAt do
+                    local localChar = LocalPlayer.Character
+                    local localRoot = localChar and localChar:FindFirstChild("HumanoidRootPart")
+                    local closest = getPreferredHitTarget()
+                    for _, player in ipairs(Players:GetPlayers()) do
+                        if player ~= LocalPlayer and isCobraCharacter(player.Character) then
+                            local target = player.Character
+                            local root = target:FindFirstChild("HumanoidRootPart")
+                            local hum = target:FindFirstChildOfClass("Humanoid")
+                            local distance = (localRoot and root) and (root.Position - localRoot.Position).Magnitude or nil
+                            local activeTracks = {}
+                            local localHum = localChar and localChar:FindFirstChildOfClass("Humanoid")
+                            local animator = localHum and localHum:FindFirstChildOfClass("Animator")
+                            if animator then
+                                for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                                    if track.IsPlaying and track.Priority.Value >= Enum.AnimationPriority.Action.Value then
+                                        activeTracks[#activeTracks + 1] = tostring(track.Name)
+                                    end
+                                end
+                            end
+                            recordCobraEvent("SAMPLE player=" .. player.Name
+                                .. " distance=" .. tostring(distance)
+                                .. " closest=" .. tostring(closest == target)
+                                .. " safe=" .. tostring(HitSafe[player.Name] == true)
+                                .. " health=" .. tostring(hum and hum.Health)
+                                .. " localAnimal=" .. cobraAnimalName(localChar)
+                                .. " attackTracks={" .. table.concat(activeTracks, ",") .. "}")
+                        end
+                    end
+                    task.wait(0.1)
+                end
+
+                CobraRecorder.active = false
+                local lines = {
+                    "=== STIMMY 5-SECOND COBRA ATTACK RECORDING ===",
+                    "Hitbox Expander: " .. tostring(Hit.on),
+                    "Closest priority: " .. tostring(Hit.priorityClosest),
+                    "Multiplier: " .. tostring(Hit.mult),
+                    "Events captured: " .. tostring(#CobraRecorder.events),
+                }
+                for _, event in ipairs(CobraRecorder.events) do
+                    lines[#lines + 1] = event
+                end
+                if #CobraRecorder.events == 0 then
+                    lines[#lines + 1] = "No Cobra player samples or Hitboxes API calls captured."
+                end
+                lines[#lines + 1] = "=== END RECORDING ==="
+                local report = table.concat(lines, "\\n")
+                print(report)
+                if setclipboard then
+                    pcall(setclipboard, report)
+                    notify("Cobra recorder", "5-second scan complete. Report copied to clipboard.")
+                else
+                    notify("Cobra recorder", "5-second scan complete. Report printed to console.")
+                end
+            end)
+        end,
+    })
+
     CombatTab:Slider({
         Title = "Hitbox Size Multiplier",
         Step = 1,
@@ -3223,7 +3473,6 @@ do
         end
     end)
 
-    do
     local plConns = {
         Players.PlayerAdded:Connect((function()
             local queued = false
@@ -3252,9 +3501,8 @@ do
             end
         end)()),
     }
-    end -- release the connection-list local before the latch feature allocates more locals
 
-    Hit.Latch = (function()
+    local Latch = (function()
     -- ---------- anti grab ----------
     local Latch = { on = false, delay = 0.1 }
     local LatchedRemote
@@ -3709,15 +3957,15 @@ do
         Title = "Anti Grab",
         Value = false,
         Flag = "AutoEscapeLatchOn",
-        Callback = function(v) Hit.Latch.on = v end,
+        Callback = function(v) Latch.on = v end,
     })
 
     CombatTab:Slider({
         Title = "Anti Grab Delay",
         Step = 0.05,
-        Value = { Min = 0, Max = 1, Default = Hit.Latch.delay },
+        Value = { Min = 0, Max = 1, Default = Latch.delay },
         Flag = "LatchEscapeDelay",
-        Callback = function(v) Hit.Latch.delay = math.clamp(v, 0, 1) end,
+        Callback = function(v) Latch.delay = math.clamp(v, 0, 1) end,
     })
 
     ;(function()
@@ -3889,7 +4137,7 @@ do
         Hit.on = false
         Aura.on = false
         AutoSpecial.on = false
-        Hit.Latch.on = false
+        Latch.on = false
         InfStam.on = false
         InfOxy.on = false
         if combatVitalsConn then combatVitalsConn:Disconnect() end
