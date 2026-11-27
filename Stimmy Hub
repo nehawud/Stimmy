@@ -2873,11 +2873,42 @@ do
         Hit.diagSeenReach[char] = true
         Hit.diagStats.Reach = Hit.diagStats.Reach + 1
         local cobraNamed = isCobraForDiagnostics(char)
-        warn("[HitboxDiag] GetReach | cobraNameMatch=" .. tostring(cobraNamed)
+        warn("[HitboxDiag] TARGET | nameMatch=" .. tostring(cobraNamed)
             .. " | model=" .. tostring(char:GetFullName())
+            .. " | class=" .. tostring(char.ClassName)
             .. " | baseReach=" .. tostring(reach)
+            .. " | reachType=" .. typeof(reach)
             .. " | expanderEnabled=" .. tostring(Hit.on)
             .. " | multiplier=" .. tostring(Hit.mult))
+        local attributes = char:GetAttributes()
+        for key, value in pairs(attributes) do
+            warn("[HitboxDiag] ATTRIBUTE | " .. tostring(key) .. "=" .. tostring(value))
+        end
+        local children = char:GetChildren()
+        local childNames = {}
+        for _, child in ipairs(children) do
+            childNames[#childNames + 1] = child.Name .. ":" .. child.ClassName
+        end
+        warn("[HitboxDiag] CHILDREN | count=" .. #children .. " | " .. table.concat(childNames, ", "))
+        local descendants = char:GetDescendants()
+        local partCount = 0
+        for _, object in ipairs(descendants) do
+            if object:IsA("BasePart") then
+                partCount = partCount + 1
+                if partCount <= 40 then
+                    warn("[HitboxDiag] PART | path=" .. object:GetFullName()
+                        .. " | size=" .. tostring(object.Size)
+                        .. " | transparency=" .. tostring(object.Transparency)
+                        .. " | canQuery=" .. tostring(object.CanQuery)
+                        .. " | canTouch=" .. tostring(object.CanTouch)
+                        .. " | canCollide=" .. tostring(object.CanCollide)
+                        .. " | collisionGroup=" .. tostring(object.CollisionGroup))
+                end
+            end
+        end
+        warn("[HitboxDiag] MODEL SUMMARY | descendants=" .. #descendants
+            .. " | baseParts=" .. partCount
+            .. " | partsPrinted=" .. math.min(partCount, 40))
     end
 
     local function installOverrides()
@@ -5759,12 +5790,12 @@ hook(SettingsTab)
 SettingsTab:Section({ Title = "Diagnostics" })
 
 SettingsTab:Paragraph({
-    Title = "Cobra Hitbox Diagnostics",
-    Content = "Records the character models passed into the game's hitbox functions, including models whose names do not contain Cobra. Enable this, reproduce one Cobra hit, then send the [HitboxDiag] console lines.",
+    Title = "Cobra Hitbox Diagnostics (Detailed)",
+    Content = "Passively inspects the target model: attributes, children, BasePart sizes, query/touch/collision settings, and GetReach results. Enable, reproduce one Cobra encounter, then send every [HitboxDiag] console line.",
 })
 
 SettingsTab:Toggle({
-    Title = "Enable Hitbox Diagnostics",
+    Title = "Enable Detailed Hitbox Scan",
     Value = false,
     Flag = "CobraHitboxDiagnostics",
     Callback = function(v)
@@ -5773,9 +5804,9 @@ SettingsTab:Toggle({
         Hit.diagSeenReach = {}
         Hit.diagStats = { Definitions = 0, Reach = 0, CobraNamed = 0 }
         if v then
-            notify("Hitbox Diagnostics", "Diagnostics enabled. Reproduce one Cobra hit, then check the Developer Console for [HitboxDiag] lines.")
+            notify("Hitbox Diagnostics", "Scan enabled. Reproduce one Cobra encounter, then copy all [HitboxDiag] lines from the Developer Console.")
         else
-            notify("Hitbox Diagnostics", "Diagnostics paused.")
+            notify("Hitbox Diagnostics", "Scan paused.")
         end
     end,
 })
@@ -5798,7 +5829,7 @@ SettingsTab:Button({
         Hit.diagSeenDefs = {}
         Hit.diagSeenReach = {}
         Hit.diagStats = { Definitions = 0, Reach = 0, CobraNamed = 0 }
-        notify("Hitbox Diagnostics", "Diagnostic counters reset.")
+        notify("Hitbox Diagnostics", "Scan counters reset.")
     end,
 })
 
