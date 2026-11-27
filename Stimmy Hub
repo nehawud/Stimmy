@@ -3190,191 +3190,128 @@ do
 
     local function runHitboxDiagnostics()
         local lines = {}
-        local function log(s)
-            lines[#lines + 1] = tostring(s)
+        local counts = {}
+        local function log(value)
+            lines[#lines + 1] = tostring(value)
         end
-        local character = LocalPlayer.Character
-        log("=== STIMMY HITBOX DIAGNOSTICS ===")
-        log("Player: " .. LocalPlayer.Name)
-        log("AnimalName: " .. tostring(character and character:GetAttribute("AnimalName")))
+        local workspaceService = game:GetService("Workspace")
+        local descendants = workspaceService:GetDescendants()
+        local total = #descendants
+        local relevant = 0
+        local detailLimit = 12000
+        local function hasClue(name)
+            name = string.lower(name)
+            for _, word in ipairs({ "cobra", "hit", "hurt", "attack", "damage", "collision", "box", "ray", "touch", "bite", "tongue", "root" }) do
+                if string.find(name, word, 1, true) then return true end
+            end
+            return false
+        end
+        local function safeValue(value)
+            local kind = typeof(value)
+            if kind == "string" or kind == "number" or kind == "boolean" then
+                return tostring(value)
+            end
+            if kind == "Vector3" or kind == "CFrame" or kind == "Color3" or kind == "EnumItem" then
+                return tostring(value)
+            end
+            return nil
+        end
+
+        log("=== STIMMY WORKSPACE DIAGNOSTICS ===")
+        log("Local player: " .. tostring(LocalPlayer.Name))
+        log("Local animal: " .. tostring(LocalPlayer.Character and LocalPlayer.Character:GetAttribute("AnimalName")))
         log("Hitbox Expander enabled: " .. tostring(Hit.on))
         log("Closest priority: " .. tostring(Hit.priorityClosest))
         log("Multiplier: " .. tostring(Hit.mult))
-        log("Hitboxes module loaded: " .. tostring(Hitboxes ~= nil))
-        if character then
-            log("Character: " .. character:GetFullName())
-            for _, attr in ipairs({ "AnimalName", "BasicAttacksDisabled", "JumpsDisabled" }) do
-                log("Character attribute " .. attr .. ": " .. tostring(character:GetAttribute(attr)))
-            end
+        log("Workspace: " .. workspaceService:GetFullName())
+        log("Total descendants: " .. tostring(total))
+        log("Format: class | full path | selected properties | attributes")
+        log("NOTE: This is a metadata inventory of every Workspace descendant, not a clone of game assets or script source.")
+
+        for _, obj in ipairs(descendants) do
+            local className = obj.ClassName
+            counts[className] = (counts[className] or 0) + 1
+            if hasClue(obj.Name) then relevant = relevant + 1 end
         end
 
-        -- Inspect the player's own animal (especially when the player equips Cobra).
-        -- This is separate from the opponent-target scan below so self-hitbox data is visible.
-        if character then
-            local ownAnimal = character:GetAttribute("AnimalName")
-            log("=== LOCAL ANIMAL HITBOX INSPECTION ===")
-            log("Local animal: " .. tostring(ownAnimal))
-            log("Local character is Cobra: " .. tostring(isCobraCharacter(character)))
-            local partCount = 0
-            local parts = {}
-            for _, obj in ipairs(character:GetDescendants()) do
-                if obj:IsA("BasePart") then
-                    partCount = partCount + 1
-                    parts[#parts + 1] = obj
-                end
-            end
-            table.sort(parts, function(a, b) return a:GetFullName() < b:GetFullName() end)
-            log("Local BasePart count: " .. tostring(partCount))
-            for _, part in ipairs(parts) do
-                log("LOCAL PART " .. part:GetFullName()
-                    .. " size=" .. tostring(part.Size)
-                    .. " transparency=" .. tostring(part.Transparency)
-                    .. " canQuery=" .. tostring(part.CanQuery)
-                    .. " canTouch=" .. tostring(part.CanTouch)
-                    .. " canCollide=" .. tostring(part.CanCollide))
+        local classNames = {}
+        for className in pairs(counts) do classNames[#classNames + 1] = className end
+        table.sort(classNames)
+        log("--- CLASS COUNTS ---")
+        for _, className in ipairs(classNames) do
+            log(className .. "=" .. tostring(counts[className]))
+        end
+        log("--- FULL DESCENDANT INVENTORY ---")
+
+        local written = 0
+        for _, obj in ipairs(descendants) do
+            if written >= detailLimit then break end
+            written = written + 1
+            local fields = { obj.ClassName, obj:GetFullName() }
+            if obj:IsA("BasePart") then
+                fields[#fields + 1] = "Size=" .. tostring(obj.Size)
+                fields[#fields + 1] = "Position=" .. tostring(obj.Position)
+                fields[#fields + 1] = "Anchored=" .. tostring(obj.Anchored)
+                fields[#fields + 1] = "CanQuery=" .. tostring(obj.CanQuery)
+                fields[#fields + 1] = "CanTouch=" .. tostring(obj.CanTouch)
+                fields[#fields + 1] = "CanCollide=" .. tostring(obj.CanCollide)
+                fields[#fields + 1] = "Transparency=" .. tostring(obj.Transparency)
+            elseif obj:IsA("Attachment") then
+                fields[#fields + 1] = "Position=" .. tostring(obj.Position)
+            elseif obj:IsA("Humanoid") then
+                fields[#fields + 1] = "Health=" .. tostring(obj.Health)
+                fields[#fields + 1] = "MaxHealth=" .. tostring(obj.MaxHealth)
+                fields[#fields + 1] = "RigType=" .. tostring(obj.RigType)
+            elseif obj:IsA("Model") then
+                local primary = obj.PrimaryPart
+                fields[#fields + 1] = "PrimaryPart=" .. tostring(primary and primary:GetFullName() or nil)
             end
 
-            local localHitboxes = Hitboxes or getHitboxes()
-            log("Local Hitboxes module available: " .. tostring(localHitboxes ~= nil))
-            if localHitboxes then
-                log("Local GetDefinitions type: " .. type(localHitboxes.GetDefinitions))
-                log("Local GetReach type: " .. type(localHitboxes.GetReach))
-                if type(localHitboxes.GetDefinitions) == "function" then
-                    local defsOk, defs = pcall(localHitboxes.GetDefinitions, character)
-                    log("LOCAL GetDefinitions success=" .. tostring(defsOk)
-                        .. " resultType=" .. type(defs)
-                        .. " count=" .. tostring(type(defs) == "table" and #defs or "n/a"))
-                    if defsOk and type(defs) == "table" then
-                        for index, def in ipairs(defs) do
-                            local fields = {}
-                            for key, value in pairs(def) do
-                                fields[#fields + 1] = tostring(key) .. "=" .. tostring(value)
-                            end
-                            table.sort(fields)
-                            log("LOCAL DEF[" .. tostring(index) .. "] " .. table.concat(fields, "; "))
-                        end
-                    elseif not defsOk then
-                        log("LOCAL GetDefinitions error: " .. tostring(defs))
-                    end
-                end
-                if type(localHitboxes.GetReach) == "function" then
-                    local reachOk, reach = pcall(localHitboxes.GetReach, character)
-                    log("LOCAL GetReach success=" .. tostring(reachOk) .. " value=" .. tostring(reach))
-                    if not reachOk then log("LOCAL GetReach error: " .. tostring(reach)) end
+            local attributes = {}
+            local ok, attributeMap = pcall(function() return obj:GetAttributes() end)
+            if ok then
+                for key, value in pairs(attributeMap) do
+                    local rendered = safeValue(value)
+                    if rendered then attributes[#attributes + 1] = tostring(key) .. "=" .. rendered end
                 end
             end
-            log("=== END LOCAL ANIMAL HITBOX INSPECTION ===")
+            table.sort(attributes)
+            if #attributes > 0 then fields[#fields + 1] = "Attributes={" .. table.concat(attributes, ",") .. "}" end
+            log(table.concat(fields, " | "))
+        end
+
+        log("--- SUMMARY ---")
+        log("Descendants inventoried: " .. tostring(written) .. "/" .. tostring(total))
+        log("Names matching hitbox/combat clues: " .. tostring(relevant))
+        if written < total then
+            log("DETAILS TRUNCATED at " .. tostring(detailLimit) .. " entries to protect clipboard/memory.")
         else
-            log("Local animal inspection skipped: LocalPlayer.Character is nil.")
+            log("Details include every Workspace descendant.")
         end
-        if Hitboxes then
-            for _, key in ipairs({ "GetDefinitions", "GetReach" }) do
-                log("Hitboxes." .. key .. " type: " .. type(Hitboxes[key]))
-            end
-            log("GetDefinitions currently wrapped: " .. tostring(Hitboxes.GetDefinitions ~= origGetDefs))
-            log("GetReach currently wrapped: " .. tostring(Hitboxes.GetReach ~= origGetReach))
-        end
+        log("=== END WORKSPACE DIAGNOSTICS ===")
 
-        -- Compare original and expanded hitbox data for each live player target.
-        local myRoot = character and character:FindFirstChild("HumanoidRootPart")
-        local preferred = getPreferredHitTarget()
-        log("Preferred target: " .. tostring(preferred and preferred.Name))
-        if Hitboxes and origGetDefs and origGetReach then
-            for _, player in ipairs(Players:GetPlayers()) do
-                if player ~= LocalPlayer and player.Character then
-                    local target = player.Character
-                    local animal = target:GetAttribute("AnimalName")
-                    local root = target:FindFirstChild("HumanoidRootPart")
-                    local distance = myRoot and root and (root.Position - myRoot.Position).Magnitude
-                    log("TARGET " .. player.Name .. " animal=" .. tostring(animal)
-                        .. " distance=" .. tostring(distance)
-                        .. " safe=" .. tostring(isHitSafe(target))
-                        .. " closest=" .. tostring(target == preferred))
-                    local baseOk, baseDefs = pcall(origGetDefs, target)
-                    local expandedOk, expandedDefs = pcall(Hitboxes.GetDefinitions, target)
-                    log("  definitions original=" .. tostring(baseOk and type(baseDefs) == "table" and #baseDefs or baseDefs)
-                        .. " expanded=" .. tostring(expandedOk and type(expandedDefs) == "table" and #expandedDefs or expandedDefs))
-                    if baseOk and expandedOk and type(baseDefs) == "table" and type(expandedDefs) == "table" then
-                        for index, def in ipairs(baseDefs) do
-                            local expanded = expandedDefs[index]
-                            if expanded then
-                                log("  def[" .. index .. "] size " .. tostring(def.Size)
-                                    .. " -> " .. tostring(expanded.Size)
-                                    .. " anchor " .. tostring(def.AnchorRadius)
-                                    .. " -> " .. tostring(expanded.AnchorRadius))
-                            end
-                        end
-                    end
-                    local reachOk, baseReach = pcall(origGetReach, target)
-                    local expandedReachOk, expandedReach = pcall(Hitboxes.GetReach, target)
-                    log("  reach original=" .. tostring(reachOk and baseReach or baseReach)
-                        .. " expanded=" .. tostring(expandedReachOk and expandedReach or expandedReach))
-                end
-            end
-        else
-            log("Live target comparison skipped: original hitbox functions unavailable.")
-        end
-
-        local found, inspected = 0, 0
-        local ok, descendants = pcall(function() return game:GetDescendants() end)
-        if ok then
-            for _, obj in ipairs(descendants) do
-                if obj:IsA("ModuleScript") then
-                    local name = string.lower(obj.Name)
-                    local pathName = string.lower(obj:GetFullName())
-                    if string.find(name, "hit", 1, true) or string.find(name, "attack", 1, true)
-                        or string.find(name, "combat", 1, true) or string.find(name, "cobra", 1, true)
-                        or string.find(pathName, "cobra", 1, true) then
-                        found = found + 1
-                        if inspected < 80 then
-                            inspected = inspected + 1
-                            log("MODULE " .. obj:GetFullName())
-                            local required, exported = pcall(require, obj)
-                            if required and type(exported) == "table" then
-                                local keys = {}
-                                for k, v in pairs(exported) do
-                                    if type(k) == "string" and (type(v) == "function"
-                                        or string.find(string.lower(k), "hit", 1, true)
-                                        or string.find(string.lower(k), "reach", 1, true)
-                                        or string.find(string.lower(k), "attack", 1, true)
-                                        or string.find(string.lower(k), "cobra", 1, true)) then
-                                        keys[#keys + 1] = k .. ":" .. type(v)
-                                    end
-                                end
-                                table.sort(keys)
-                                log("  exports: " .. (#keys > 0 and table.concat(keys, ", ") or "(no relevant exports)"))
-                            elseif not required then
-                                log("  require failed: " .. tostring(exported))
-                            else
-                                log("  export type: " .. type(exported))
-                            end
-                        end
-                    end
-                end
-            end
-        else
-            log("GetDescendants failed: " .. tostring(descendants))
-        end
-        log("Matching ModuleScripts: " .. tostring(found) .. " (inspected " .. tostring(inspected) .. ")")
-        log("=== END DIAGNOSTICS ===")
         local report = table.concat(lines, "\n")
         print(report)
         if setclipboard then
-            pcall(setclipboard, report)
-            notify("Hitbox diagnostics", "Scan complete. Report printed and copied to clipboard.")
+            local copied = pcall(setclipboard, report)
+            if copied then
+                notify("Workspace diagnostics", "Workspace inventory copied to clipboard.")
+            else
+                notify("Workspace diagnostics", "Copy failed. Report was printed to the executor console.")
+            end
         else
-            notify("Hitbox diagnostics", "Scan complete. Report printed to the executor console.")
+            notify("Workspace diagnostics", "Report printed to the executor console; clipboard API unavailable.")
         end
     end
 
     CombatTab:Button({
-        Title = "Scan Hitbox / Cobra Diagnostics",
+        Title = "Copy Workspace Diagnostics",
         Callback = function()
             task.spawn(function()
                 local ok, err = pcall(runHitboxDiagnostics)
                 if not ok then
-                    warn("[Stimmy] Hitbox diagnostics failed: " .. tostring(err))
-                    notify("Hitbox diagnostics", "Scan failed: " .. tostring(err))
+                    warn("[Stimmy] Workspace diagnostics failed: " .. tostring(err))
+                    notify("Workspace diagnostics", "Scan failed: " .. tostring(err))
                 end
             end)
         end,
