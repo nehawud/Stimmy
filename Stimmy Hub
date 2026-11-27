@@ -3661,7 +3661,7 @@ do
             end,
         })
 
-        table.insert(Hit.playerConnections, Players.PlayerAdded:Connect(function(player)
+        table.insert(HitFeature.state.playerConnections, Players.PlayerAdded:Connect(function(player)
             task.defer(function() addFriendToWhitelists(player) end)
         end))
 
@@ -4084,10 +4084,10 @@ do
             PredatorAlert.ignoredPlayers = selected
         end,
     })
-    table.insert(Hit.playerConnections, Players.PlayerAdded:Connect(function()
+    table.insert(HitFeature.state.playerConnections, Players.PlayerAdded:Connect(function()
         task.defer(refreshIgnorePlayerNames)
     end))
-    table.insert(Hit.playerConnections, Players.PlayerRemoving:Connect(function()
+    table.insert(HitFeature.state.playerConnections, Players.PlayerRemoving:Connect(function()
         task.delay(0.3, refreshIgnorePlayerNames)
     end))
 
