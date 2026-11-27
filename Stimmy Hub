@@ -2831,7 +2831,8 @@ do
     end
 
     local function logHitboxDiag(message)
-        local line = "[HitboxDiag] " .. tostring(message)
+        local line = tostring(message)
+        if not line:find("^%[HitboxDiag%]") then line = "[HitboxDiag] " .. line end
         Hit.diagLines[#Hit.diagLines + 1] = line
         warn(line)
     end
