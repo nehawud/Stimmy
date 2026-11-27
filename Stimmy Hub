@@ -3204,19 +3204,6 @@ do
     end
 
     CombatTab:Button({
-        Title = "Scan Hitbox / Cobra Diagnostics",
-        Callback = function()
-            task.spawn(function()
-                local ok, err = pcall(runHitboxDiagnostics)
-                if not ok then
-                    warn("[Stimmy] Hitbox diagnostics failed: " .. tostring(err))
-                    notify("Hitbox diagnostics", "Scan failed: " .. tostring(err))
-                end
-            end)
-        end,
-    })
-
-    CombatTab:Button({
         Title = "Record Cobra Attack Scan (5s)",
         Callback = function()
             if CobraRecorder.active then
@@ -3291,6 +3278,8 @@ do
             end)
         end,
     })
+
+
 
     CombatTab:Slider({
         Title = "Hitbox Size Multiplier",
