@@ -3207,6 +3207,66 @@ do
                 log("Character attribute " .. attr .. ": " .. tostring(character:GetAttribute(attr)))
             end
         end
+
+        -- Inspect the player's own animal (especially when the player equips Cobra).
+        -- This is separate from the opponent-target scan below so self-hitbox data is visible.
+        if character then
+            local ownAnimal = character:GetAttribute("AnimalName")
+            log("=== LOCAL ANIMAL HITBOX INSPECTION ===")
+            log("Local animal: " .. tostring(ownAnimal))
+            log("Local character is Cobra: " .. tostring(isCobraCharacter(character)))
+            local partCount = 0
+            local parts = {}
+            for _, obj in ipairs(character:GetDescendants()) do
+                if obj:IsA("BasePart") then
+                    partCount = partCount + 1
+                    parts[#parts + 1] = obj
+                end
+            end
+            table.sort(parts, function(a, b) return a:GetFullName() < b:GetFullName() end)
+            log("Local BasePart count: " .. tostring(partCount))
+            for _, part in ipairs(parts) do
+                log("LOCAL PART " .. part:GetFullName()
+                    .. " size=" .. tostring(part.Size)
+                    .. " transparency=" .. tostring(part.Transparency)
+                    .. " canQuery=" .. tostring(part.CanQuery)
+                    .. " canTouch=" .. tostring(part.CanTouch)
+                    .. " canCollide=" .. tostring(part.CanCollide))
+            end
+
+            local localHitboxes = Hitboxes or getHitboxes()
+            log("Local Hitboxes module available: " .. tostring(localHitboxes ~= nil))
+            if localHitboxes then
+                log("Local GetDefinitions type: " .. type(localHitboxes.GetDefinitions))
+                log("Local GetReach type: " .. type(localHitboxes.GetReach))
+                if type(localHitboxes.GetDefinitions) == "function" then
+                    local defsOk, defs = pcall(localHitboxes.GetDefinitions, character)
+                    log("LOCAL GetDefinitions success=" .. tostring(defsOk)
+                        .. " resultType=" .. type(defs)
+                        .. " count=" .. tostring(type(defs) == "table" and #defs or "n/a"))
+                    if defsOk and type(defs) == "table" then
+                        for index, def in ipairs(defs) do
+                            local fields = {}
+                            for key, value in pairs(def) do
+                                fields[#fields + 1] = tostring(key) .. "=" .. tostring(value)
+                            end
+                            table.sort(fields)
+                            log("LOCAL DEF[" .. tostring(index) .. "] " .. table.concat(fields, "; "))
+                        end
+                    elseif not defsOk then
+                        log("LOCAL GetDefinitions error: " .. tostring(defs))
+                    end
+                end
+                if type(localHitboxes.GetReach) == "function" then
+                    local reachOk, reach = pcall(localHitboxes.GetReach, character)
+                    log("LOCAL GetReach success=" .. tostring(reachOk) .. " value=" .. tostring(reach))
+                    if not reachOk then log("LOCAL GetReach error: " .. tostring(reach)) end
+                end
+            end
+            log("=== END LOCAL ANIMAL HITBOX INSPECTION ===")
+        else
+            log("Local animal inspection skipped: LocalPlayer.Character is nil.")
+        end
         if Hitboxes then
             for _, key in ipairs({ "GetDefinitions", "GetReach" }) do
                 log("Hitboxes." .. key .. " type: " .. type(Hitboxes[key]))
